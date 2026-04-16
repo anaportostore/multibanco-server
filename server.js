@@ -8,6 +8,40 @@ app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(cors());
 
+// ─── ROTA TEMPORÁRIA PARA OBTER O shpat_ ───────────────────────────────────
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+const SHOP = 'anadalfama.myshopify.com';
+const SCOPES = 'read_customers,write_customers,write_draft_orders,read_draft_orders,read_orders,write_orders';
+
+app.get('/auth', (req, res) => {
+  const redirectUri = `https://${req.headers.host}/auth/callback`;
+  const authUrl = `https://${SHOP}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${SCOPES}&redirect_uri=${redirectUri}&state=secure123`;
+  res.redirect(authUrl);
+});
+
+app.get('/auth/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (state !== 'secure123') return res.status(400).send('State inválido');
+
+  try {
+    const response = await fetch(`https://${SHOP}/admin/oauth/access_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_CLIENT_SECRET,
+        code,
+      }),
+    });
+    const data = await response.json();
+    res.send(`<h1>✅ Token obtido!</h1><p>Copia este token para o Railway:</p><pre style="font-size:18px;background:#eee;padding:20px">${data.access_token}</pre><p>Depois remove a rota /auth do servidor.</p>`);
+  } catch (err) {
+    res.status(500).send(`Erro: ${err.message}`);
+  }
+});
+// ───────────────────────────────────────────────────────────────────────────
+
 app.post('/create-multibanco', async (req, res) => {
   try {
     const { amount, currency = 'eur', customer_email, customer_name, address, cart_items } = req.body;
