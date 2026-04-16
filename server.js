@@ -4,24 +4,22 @@ const cors = require('cors');
 
 const app = express();
 
-// Webhook precisa do body raw, por isso vem antes do express.json()
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
-app.use(cors({ origin: 'https://www.anadalfama.pt' }));
+app.use(cors());
 
-// ─── 1. CRIAR REFERÊNCIA MULTIBANCO ────────────────────────────────────────
-// O Shopify chama este endpoint quando o cliente escolhe Multibanco
 app.post('/create-multibanco', async (req, res) => {
   try {
-    const { amount, currency = 'eur', customer_email, order_id } = req.body;
+    const { amount, currency = 'eur', customer_email, customer_name, address, cart_items } = req.body;
 
-    if (!amount || !customer_email || !order_id) {
-      return res.status(400).json({ error: 'Faltam campos obrigatórios: amount, customer_email, order_id' });
+    if (!amount || !customer_email) {
+      return res.status(400).json({ error: 'Faltam campos obrigatórios' });
     }
 
-    // Cria o PaymentIntent com Multibanco
+    const draftOrder = await createShopifyDraftOrder({ customer_email, customer_name, address, cart_items, amount });
+
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(amount * 100), // Stripe usa cêntimos: 47.90 → 4790
+      amount: Math.round(amount * 100),
       currency,
       payment_method_types: ['multibanco'],
       payment_method_data: {
@@ -30,12 +28,12 @@ app.post('/create-multibanco', async (req, res) => {
       },
       confirm: true,
       metadata: {
-        shopify_order_id: order_id,
+        shopify_draft_order_id: draftOrder.id,
+        shopify_draft_order_name: draftOrder.name,
         shop: 'anadalfama.pt',
       },
     });
 
-    // Extrai os dados Multibanco gerados pela Stripe
     const multibancoDetails = paymentIntent.next_action?.multibanco_display_details;
 
     if (!multibancoDetails) {
@@ -47,7 +45,8 @@ app.post('/create-multibanco', async (req, res) => {
       entity: multibancoDetails.entity,
       reference: multibancoDetails.reference,
       amount: amount,
-      expires_at: multibancoDetails.expires_at, // timestamp Unix
+      expires_at: multibancoDetails.expires_at,
+      order_name: draftOrder.name,
     });
 
   } catch (err) {
@@ -56,82 +55,123 @@ app.post('/create-multibanco', async (req, res) => {
   }
 });
 
-// ─── 2. WEBHOOK — CONFIRMAR PAGAMENTO ──────────────────────────────────────
-// A Stripe chama este endpoint quando o cliente paga no ATM/homebanking
+async function createShopifyDraftOrder({ customer_email, customer_name, address, cart_items, amount }) {
+  const nameParts = (customer_name || '').split(' ');
+  const firstName = nameParts[0] || '';
+  const lastName = nameParts.slice(1).join(' ') || '';
+
+  const lineItems = cart_items?.map(item => ({
+    variant_id: item.variant_id,
+    quantity: item.quantity,
+  })) || [];
+
+  const body = {
+    draft_order: {
+      line_items: lineItems,
+      customer: { email: customer_email },
+      shipping_address: {
+        first_name: firstName,
+        last_name: lastName,
+        address1: address?.address1 || '',
+        city: address?.city || '',
+        zip: address?.zip || '',
+        country: address?.country || 'PT',
+        phone: address?.phone || '',
+      },
+      billing_address: {
+        first_name: firstName,
+        last_name: lastName,
+        address1: address?.address1 || '',
+        city: address?.city || '',
+        zip: address?.zip || '',
+        country: address?.country || 'PT',
+      },
+      shipping_line: {
+        title: 'Envio Standard',
+        price: '0.00',
+        code: 'envio-standard',
+      },
+      financial_status: 'pending',
+      tags: 'multibanco,aguarda-pagamento',
+      note: 'Pagamento por Multibanco — aguarda confirmação',
+    }
+  };
+
+  const response = await fetch(
+    'https://anadalfama.myshopify.com/admin/api/2024-01/draft_orders.json',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+      },
+      body: JSON.stringify(body),
+    }
+  );
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Shopify Draft Order erro: ${error}`);
+  }
+
+  const data = await response.json();
+  return data.draft_order;
+}
+
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
 
   try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error('Webhook inválido:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Pagamento Multibanco confirmado ✅
   if (event.type === 'payment_intent.succeeded') {
     const paymentIntent = event.data.object;
-    const shopifyOrderId = paymentIntent.metadata?.shopify_order_id;
-
-    if (shopifyOrderId) {
-      console.log(`✅ Pagamento confirmado para encomenda Shopify #${shopifyOrderId}`);
-
-      // Marcar encomenda como paga no Shopify
-      await confirmShopifyOrder(shopifyOrderId, paymentIntent.id);
+    const draftOrderId = paymentIntent.metadata?.shopify_draft_order_id;
+    if (draftOrderId) {
+      console.log(`✅ Pagamento confirmado — a completar encomenda #${draftOrderId}`);
+      await completeDraftOrder(draftOrderId, paymentIntent.id);
     }
   }
 
-  // Referência expirou sem pagamento ⏱
   if (event.type === 'payment_intent.payment_failed') {
     const paymentIntent = event.data.object;
-    const shopifyOrderId = paymentIntent.metadata?.shopify_order_id;
-    console.log(`⏱ Referência expirou para encomenda #${shopifyOrderId}`);
-    // Podes aqui cancelar a encomenda no Shopify se quiseres
+    console.log(`⏱ Referência expirou — draft order ${paymentIntent.metadata?.shopify_draft_order_id}`);
   }
 
   res.json({ received: true });
 });
 
-// ─── 3. CONFIRMAR ENCOMENDA NO SHOPIFY ─────────────────────────────────────
-async function confirmShopifyOrder(orderId, paymentIntentId) {
+async function completeDraftOrder(draftOrderId, paymentIntentId) {
   try {
     const response = await fetch(
-      `https://anadalfama.myshopify.com/admin/api/2024-01/orders/${orderId}/transactions.json`,
+      `https://anadalfama.myshopify.com/admin/api/2024-01/draft_orders/${draftOrderId}/complete.json?payment_gateway=multibanco&payment_pending=false`,
       {
-        method: 'POST',
+        method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
           'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
         },
-        body: JSON.stringify({
-          transaction: {
-            kind: 'capture',
-            status: 'success',
-            gateway: 'stripe_multibanco',
-            authorization: paymentIntentId,
-          },
-        }),
       }
     );
 
     if (!response.ok) {
       const error = await response.text();
-      throw new Error(`Shopify API erro: ${error}`);
+      throw new Error(`Erro ao completar draft order: ${error}`);
     }
 
-    console.log(`✅ Encomenda #${orderId} marcada como paga no Shopify`);
+    const data = await response.json();
+    console.log(`✅ Encomenda ${data.order?.name} criada com sucesso!`);
   } catch (err) {
-    console.error('Erro ao confirmar no Shopify:', err.message);
+    console.error('Erro ao completar encomenda:', err.message);
   }
 }
 
-// ─── HEALTH CHECK ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'Ana Dalfama — Multibanco Server' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor Multibanco a correr na porta ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor Multibanco na porta ${PORT}`));
