@@ -1,11 +1,62 @@
 const express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(cors());
+
+const FB_PIXEL_ID = '753350047833434';
+const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
+
+function hashData(value) {
+  if (!value) return undefined;
+  return crypto.createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
+}
+
+async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orderId, orderName }) {
+  try {
+    const eventData = {
+      data: [
+        {
+          event_name: 'Purchase',
+          event_time: Math.floor(Date.now() / 1000),
+          action_source: 'website',
+          event_source_url: 'https://www.anadalfama.pt',
+          user_data: {
+            em: [hashData(email)],
+            country: [hashData('pt')],
+          },
+          custom_data: {
+            currency: currency.toLowerCase(),
+            value: amount,
+            order_id: orderName || orderId,
+          },
+        },
+      ],
+    };
+
+    const response = await fetch(
+      `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(eventData),
+      }
+    );
+
+    const result = await response.json();
+    if (result.error) {
+      console.error('❌ Facebook CAPI erro:', result.error.message);
+    } else {
+      console.log(`✅ Facebook Purchase enviado — order ${orderName}, valor ${amount} ${currency}`);
+    }
+  } catch (err) {
+    console.error('❌ Erro ao enviar evento Facebook:', err.message);
+  }
+}
 
 app.post('/create-multibanco', async (req, res) => {
   try {
@@ -29,6 +80,9 @@ app.post('/create-multibanco', async (req, res) => {
       metadata: {
         shopify_draft_order_id: draftOrder.id,
         shopify_draft_order_name: draftOrder.name,
+        customer_email: customer_email,
+        amount: amount,
+        currency: currency,
         shop: 'anadalfama.pt',
       },
     });
@@ -127,7 +181,18 @@ app.post('/webhook', async (req, res) => {
     const draftOrderId = pi.metadata?.shopify_draft_order_id;
     if (draftOrderId) {
       console.log(`✅ Pagamento confirmado — a completar encomenda #${draftOrderId}`);
-      await completeDraftOrder(draftOrderId, pi.id);
+      const order = await completeDraftOrder(draftOrderId, pi.id);
+
+      // Disparar evento Purchase para o Facebook
+      if (order) {
+        await sendFacebookPurchaseEvent({
+          email: pi.metadata?.customer_email,
+          amount: parseFloat(pi.metadata?.amount) || (pi.amount_received / 100),
+          currency: pi.metadata?.currency || pi.currency,
+          orderId: draftOrderId,
+          orderName: order.name,
+        });
+      }
     }
   }
 
@@ -159,8 +224,10 @@ async function completeDraftOrder(draftOrderId, paymentIntentId) {
 
     const data = await response.json();
     console.log(`✅ Encomenda ${data.order?.name} criada!`);
+    return data.order;
   } catch (err) {
     console.error('Erro ao completar encomenda:', err.message);
+    return null;
   }
 }
 
