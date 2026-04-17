@@ -36,6 +36,7 @@ async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orde
           },
         },
       ],
+      ...(process.env.FB_TEST_EVENT_CODE && { test_event_code: process.env.FB_TEST_EVENT_CODE }),
     };
 
     const response = await fetch(
