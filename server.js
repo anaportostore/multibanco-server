@@ -93,7 +93,7 @@ async function createShopifyDraftOrder({ customer_email, customer_name, address,
   };
 
   const response = await fetch(
-    'https://anadalfama.myshopify.com/admin/api/2024-01/draft_orders.json',
+    'https://vu1ntd-yz.myshopify.com/admin/api/2024-01/draft_orders.json',
     {
       method: 'POST',
       headers: {
@@ -142,7 +142,7 @@ app.post('/webhook', async (req, res) => {
 async function completeDraftOrder(draftOrderId, paymentIntentId) {
   try {
     const response = await fetch(
-      `https://anadalfama.myshopify.com/admin/api/2024-01/draft_orders/${draftOrderId}/complete.json?payment_gateway=multibanco&payment_pending=false`,
+      `https://vu1ntd-yz.myshopify.com/admin/api/2024-01/draft_orders/${draftOrderId}/complete.json?payment_gateway=multibanco&payment_pending=false`,
       {
         method: 'PUT',
         headers: {
