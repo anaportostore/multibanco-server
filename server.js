@@ -11,10 +11,66 @@ app.use(cors());
 const FB_PIXEL_ID = '753350047833434';
 const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
 
-// ✅ Token sempre fresco — nunca fica em cache
+// ✅ Token sempre fresco
 function getShopifyToken() {
   return process.env.SHOPIFY_ADMIN_TOKEN;
 }
+
+// ✅ Enviar alerta para o Telegram
+async function sendTelegramAlert(message) {
+  try {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    if (!token || !chatId) return;
+
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+        parse_mode: 'HTML',
+      }),
+    });
+    console.log('✅ Alerta Telegram enviado!');
+  } catch (err) {
+    console.error('❌ Erro ao enviar Telegram:', err.message);
+  }
+}
+
+// ✅ Verificar se o token Shopify ainda funciona (corre a cada hora)
+async function checkShopifyToken() {
+  try {
+    const response = await fetch(
+      'https://vu1ntd-yz.myshopify.com/admin/api/2024-01/shop.json',
+      {
+        headers: {
+          'X-Shopify-Access-Token': getShopifyToken(),
+        },
+      }
+    );
+
+    if (response.status === 401 || response.status === 403) {
+      console.error('❌ Token Shopify inválido!');
+      await sendTelegramAlert(
+        '⚠️ <b>Token Shopify Inválido!</b>\n\n' +
+        'O token <b>SHOPIFY_ADMIN_TOKEN</b> no Railway deixou de funcionar.\n\n' +
+        '1. Vai ao Shopify → Settings → Apps → Develop Apps\n' +
+        '2. Copia o novo token\n' +
+        '3. Actualiza no Railway → Variables → SHOPIFY_ADMIN_TOKEN'
+      );
+    } else {
+      console.log('✅ Token Shopify válido!');
+    }
+  } catch (err) {
+    console.error('❌ Erro ao verificar token:', err.message);
+  }
+}
+
+// ✅ Verificar token a cada hora
+setInterval(checkShopifyToken, 60 * 60 * 1000);
+// ✅ Verificar também ao arrancar
+checkShopifyToken();
 
 function hashData(value) {
   if (!value) return undefined;
@@ -63,7 +119,7 @@ async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orde
   }
 }
 
-// ✅ Rota para actualizar o token sem reiniciar o servidor
+// ✅ Rota para actualizar o token manualmente sem reiniciar
 app.post('/update-token', (req, res) => {
   const { secret, token } = req.body;
   if (secret !== process.env.ADMIN_SECRET) {
@@ -71,6 +127,7 @@ app.post('/update-token', (req, res) => {
   }
   process.env.SHOPIFY_ADMIN_TOKEN = token;
   console.log('✅ Token Shopify actualizado em runtime!');
+  sendTelegramAlert('✅ <b>Token Shopify actualizado com sucesso!</b>\nO servidor está a funcionar normalmente.');
   res.json({ success: true });
 });
 
@@ -168,7 +225,7 @@ async function createShopifyDraftOrder({ customer_email, customer_name, address,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': getShopifyToken(), // ✅ sempre fresco
+        'X-Shopify-Access-Token': getShopifyToken(),
       },
       body: JSON.stringify(body),
     }
@@ -176,6 +233,13 @@ async function createShopifyDraftOrder({ customer_email, customer_name, address,
 
   if (!response.ok) {
     const error = await response.text();
+    if (response.status === 401 || response.status === 403) {
+      await sendTelegramAlert(
+        '🚨 <b>URGENTE — Token Shopify inválido!</b>\n\n' +
+        'Uma encomenda falhou por causa do token.\n' +
+        'Actualiza o <b>SHOPIFY_ADMIN_TOKEN</b> no Railway imediatamente!'
+      );
+    }
     throw new Error(`Shopify Draft Order erro: ${error}`);
   }
 
@@ -227,7 +291,7 @@ async function completeDraftOrder(draftOrderId, paymentIntentId) {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
-          'X-Shopify-Access-Token': getShopifyToken(), // ✅ sempre fresco
+          'X-Shopify-Access-Token': getShopifyToken(),
         },
       }
     );
