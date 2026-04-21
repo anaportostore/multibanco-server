@@ -11,6 +11,11 @@ app.use(cors());
 const FB_PIXEL_ID = '753350047833434';
 const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
 
+// ✅ Token sempre fresco — nunca fica em cache
+function getShopifyToken() {
+  return process.env.SHOPIFY_ADMIN_TOKEN;
+}
+
 function hashData(value) {
   if (!value) return undefined;
   return crypto.createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
@@ -57,6 +62,17 @@ async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orde
     console.error('❌ Erro ao enviar evento Facebook:', err.message);
   }
 }
+
+// ✅ Rota para actualizar o token sem reiniciar o servidor
+app.post('/update-token', (req, res) => {
+  const { secret, token } = req.body;
+  if (secret !== process.env.ADMIN_SECRET) {
+    return res.status(401).json({ error: 'Não autorizado' });
+  }
+  process.env.SHOPIFY_ADMIN_TOKEN = token;
+  console.log('✅ Token Shopify actualizado em runtime!');
+  res.json({ success: true });
+});
 
 app.post('/create-multibanco', async (req, res) => {
   try {
@@ -152,7 +168,7 @@ async function createShopifyDraftOrder({ customer_email, customer_name, address,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+        'X-Shopify-Access-Token': getShopifyToken(), // ✅ sempre fresco
       },
       body: JSON.stringify(body),
     }
@@ -183,7 +199,6 @@ app.post('/webhook', async (req, res) => {
       console.log(`✅ Pagamento confirmado — a completar encomenda #${draftOrderId}`);
       const order = await completeDraftOrder(draftOrderId, pi.id);
 
-      // Disparar evento Purchase para o Facebook
       if (order) {
         await sendFacebookPurchaseEvent({
           email: pi.metadata?.customer_email,
@@ -212,7 +227,7 @@ async function completeDraftOrder(draftOrderId, paymentIntentId) {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
-          'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+          'X-Shopify-Access-Token': getShopifyToken(), // ✅ sempre fresco
         },
       }
     );
