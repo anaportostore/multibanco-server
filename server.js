@@ -1,5 +1,7 @@
 const express = require('express');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2024-06-20',
+});
 const cors = require('cors');
 const crypto = require('crypto');
 
