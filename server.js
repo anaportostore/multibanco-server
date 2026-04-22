@@ -180,19 +180,21 @@ app.post('/create-multibanco', async (req, res) => {
       return res.status(400).json({ error: 'Faltam campos obrigatórios' });
     }
 
-    // ✅ Garante token válido ANTES de processar
     await ensureValidToken();
 
     const draftOrder = await createShopifyDraftOrder({ customer_email, customer_name, address, cart_items, amount });
+
+    // ✅ Corrigido para Stripe v14 — criar PaymentMethod separadamente
+    const paymentMethod = await stripe.paymentMethods.create({
+      type: 'multibanco',
+      billing_details: { email: customer_email },
+    });
 
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100),
       currency,
       payment_method_types: ['multibanco'],
-      payment_method_data: {
-        type: 'multibanco',
-        billing_details: { email: customer_email },
-      },
+      payment_method: paymentMethod.id,
       confirm: true,
       metadata: {
         shopify_draft_order_id: draftOrder.id,
@@ -207,7 +209,6 @@ app.post('/create-multibanco', async (req, res) => {
     const mb = paymentIntent.next_action?.multibanco_display_details;
     if (!mb) throw new Error('Multibanco não ativado na Stripe.');
 
-    // ✅ Notifica no Telegram quando referência é gerada com sucesso
     await sendTelegramAlert(
       `🛍️ <b>Nova referência gerada!</b>\n\n` +
       `👤 Cliente: ${customer_name}\n` +
@@ -227,15 +228,12 @@ app.post('/create-multibanco', async (req, res) => {
 
   } catch (err) {
     console.error('Erro:', err.message);
-
-    // ✅ Notifica no Telegram quando falha
     await sendTelegramAlert(
       `🚨 <b>Erro ao gerar referência!</b>\n\n` +
       `❌ Erro: ${err.message}\n\n` +
       `Um cliente tentou pagar mas não conseguiu.\n` +
       `Verifica o servidor no Railway!`
     );
-
     res.status(500).json({ error: err.message });
   }
 });
@@ -318,7 +316,6 @@ app.post('/webhook', async (req, res) => {
       console.log(`✅ Pagamento confirmado — a completar encomenda #${draftOrderId}`);
       const order = await completeDraftOrder(draftOrderId, pi.id);
       if (order) {
-        // ✅ Notifica no Telegram quando pagamento é confirmado
         await sendTelegramAlert(
           `💰 <b>Pagamento confirmado!</b>\n\n` +
           `📦 Encomenda: ${order.name}\n` +
