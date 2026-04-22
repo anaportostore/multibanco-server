@@ -68,14 +68,17 @@ app.post('/create-multibanco', async (req, res) => {
 
     const draftOrder = await createShopifyDraftOrder({ customer_email, customer_name, address, cart_items, amount });
 
+    // ✅ Criar PaymentMethod separadamente (correcto para Stripe v14)
+    const paymentMethod = await stripe.paymentMethods.create({
+      type: 'multibanco',
+      billing_details: { email: customer_email },
+    });
+
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100),
       currency,
       payment_method_types: ['multibanco'],
-      payment_method_data: {
-        type: 'multibanco',
-        billing_details: { email: customer_email },
-      },
+      payment_method: paymentMethod.id,
       confirm: true,
       metadata: {
         shopify_draft_order_id: draftOrder.id,
