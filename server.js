@@ -80,6 +80,7 @@ app.post('/create-multibanco', async (req, res) => {
       payment_method_types: ['multibanco'],
       payment_method: paymentMethod.id,
       confirm: true,
+      return_url: 'https://www.anadalfama.pt',
       metadata: {
         shopify_draft_order_id: draftOrder.id,
         shopify_draft_order_name: draftOrder.name,
