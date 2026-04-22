@@ -79,6 +79,7 @@ app.post('/create-multibanco', async (req, res) => {
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(parseFloat(amount) * 100),
       currency,
+      automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
       payment_method: paymentMethod.id,
       confirm: true,
       return_url: 'https://www.anadalfama.pt',
