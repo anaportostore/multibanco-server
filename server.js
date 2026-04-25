@@ -13,6 +13,102 @@ app.use(cors());
 const FB_PIXEL_ID = '753350047833434';
 const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
 
+// ===== Shopify Token Management =====
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN || 'vu1ntd-yz.myshopify.com';
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+
+let shopifyTokenCache = {
+  token: null,
+  expires_at: 0,
+};
+let refreshPromise = null;
+
+async function fetchNewShopifyToken() {
+  console.log('🔄 A obter novo token Shopify...');
+
+  const response = await fetch(
+    `https://${SHOPIFY_SHOP}/admin/oauth/access_token`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'client_credentials',
+        client_id: SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_CLIENT_SECRET,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Falha ao obter token Shopify: ${error}`);
+  }
+
+  const data = await response.json();
+
+  shopifyTokenCache = {
+    token: data.access_token,
+    expires_at: Date.now() + (data.expires_in * 1000),
+  };
+
+  console.log(`✅ Novo token Shopify obtido — expira em ${Math.round(data.expires_in / 3600)}h`);
+  return shopifyTokenCache.token;
+}
+
+async function getShopifyToken() {
+  const SAFETY_MARGIN = 5 * 60 * 1000; // renova 5 min antes de expirar
+
+  // Token ainda válido em cache?
+  if (shopifyTokenCache.token && shopifyTokenCache.expires_at - Date.now() > SAFETY_MARGIN) {
+    return shopifyTokenCache.token;
+  }
+
+  // Já há uma renovação em curso? Aproveita
+  if (refreshPromise) {
+    return refreshPromise;
+  }
+
+  // Inicia nova renovação
+  refreshPromise = fetchNewShopifyToken().finally(() => {
+    refreshPromise = null;
+  });
+
+  return refreshPromise;
+}
+
+// Wrapper que faz fetch à API Shopify e renova token automaticamente em 401
+async function shopifyFetch(path, options = {}) {
+  let token = await getShopifyToken();
+
+  let response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
+    ...options,
+    headers: {
+      ...options.headers,
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': token,
+    },
+  });
+
+  // Se 401, força renovação e tenta novamente
+  if (response.status === 401) {
+    console.log('⚠️ Token Shopify rejeitado — a renovar...');
+    shopifyTokenCache.expires_at = 0; // invalida cache
+    token = await getShopifyToken();
+
+    response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
+      ...options,
+      headers: {
+        ...options.headers,
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': token,
+      },
+    });
+  }
+
+  return response;
+}
+
 function hashData(value) {
   if (!value) return undefined;
   return crypto.createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
@@ -152,14 +248,10 @@ async function createShopifyDraftOrder({ customer_email, customer_name, address,
     }
   };
 
-  const response = await fetch(
-    'https://vu1ntd-yz.myshopify.com/admin/api/2024-01/draft_orders.json',
+  const response = await shopifyFetch(
+    '/admin/api/2024-01/draft_orders.json',
     {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
-      },
       body: JSON.stringify(body),
     }
   );
@@ -211,15 +303,9 @@ app.post('/webhook', async (req, res) => {
 
 async function completeDraftOrder(draftOrderId, paymentIntentId) {
   try {
-    const response = await fetch(
-      `https://vu1ntd-yz.myshopify.com/admin/api/2024-01/draft_orders/${draftOrderId}/complete.json?payment_gateway=multibanco&payment_pending=false`,
-      {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
-        },
-      }
+    const response = await shopifyFetch(
+      `/admin/api/2024-01/draft_orders/${draftOrderId}/complete.json?payment_gateway=multibanco&payment_pending=false`,
+      { method: 'PUT' }
     );
 
     if (!response.ok) {
