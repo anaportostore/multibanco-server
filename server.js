@@ -13,6 +13,45 @@ app.use(cors());
 const FB_PIXEL_ID = '753350047833434';
 const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
 
+// ===== Telegram =====
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+async function sendTelegramMessage(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log('⚠️ Telegram não configurado');
+    return;
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text: text,
+          parse_mode: 'HTML',
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error('❌ Telegram erro:', error);
+    } else {
+      console.log('✅ Notificação Telegram enviada');
+    }
+  } catch (err) {
+    console.error('❌ Erro Telegram:', err.message);
+  }
+}
+
+function formatEUR(amount) {
+  return `${parseFloat(amount).toFixed(2)} €`;
+}
+
 // ===== Shopify Token Management =====
 const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN || 'vu1ntd-yz.myshopify.com';
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
@@ -57,19 +96,16 @@ async function fetchNewShopifyToken() {
 }
 
 async function getShopifyToken() {
-  const SAFETY_MARGIN = 5 * 60 * 1000; // renova 5 min antes de expirar
+  const SAFETY_MARGIN = 5 * 60 * 1000;
 
-  // Token ainda válido em cache?
   if (shopifyTokenCache.token && shopifyTokenCache.expires_at - Date.now() > SAFETY_MARGIN) {
     return shopifyTokenCache.token;
   }
 
-  // Já há uma renovação em curso? Aproveita
   if (refreshPromise) {
     return refreshPromise;
   }
 
-  // Inicia nova renovação
   refreshPromise = fetchNewShopifyToken().finally(() => {
     refreshPromise = null;
   });
@@ -77,7 +113,6 @@ async function getShopifyToken() {
   return refreshPromise;
 }
 
-// Wrapper que faz fetch à API Shopify e renova token automaticamente em 401
 async function shopifyFetch(path, options = {}) {
   let token = await getShopifyToken();
 
@@ -90,10 +125,9 @@ async function shopifyFetch(path, options = {}) {
     },
   });
 
-  // Se 401, força renovação e tenta novamente
   if (response.status === 401) {
     console.log('⚠️ Token Shopify rejeitado — a renovar...');
-    shopifyTokenCache.expires_at = 0; // invalida cache
+    shopifyTokenCache.expires_at = 0;
     token = await getShopifyToken();
 
     response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
@@ -166,7 +200,6 @@ app.post('/create-multibanco', async (req, res) => {
 
     const draftOrder = await createShopifyDraftOrder({ customer_email, customer_name, address, cart_items, amount });
 
-    // ✅ Criar PaymentMethod separadamente (correcto para Stripe v14)
     const paymentMethod = await stripe.paymentMethods.create({
       type: 'multibanco',
       billing_details: { email: customer_email },
@@ -183,6 +216,7 @@ app.post('/create-multibanco', async (req, res) => {
         shopify_draft_order_id: draftOrder.id,
         shopify_draft_order_name: draftOrder.name,
         customer_email: customer_email,
+        customer_name: customer_name || '',
         amount: amount,
         currency: currency,
         shop: 'anadalfama.pt',
@@ -191,6 +225,18 @@ app.post('/create-multibanco', async (req, res) => {
 
     const mb = paymentIntent.next_action?.multibanco_display_details;
     if (!mb) throw new Error('Multibanco não ativado na Stripe.');
+
+    // 📱 Telegram: Referência criada
+    await sendTelegramMessage(
+      `🆕 <b>Nova referência Multibanco gerada</b>\n\n` +
+      `📦 Encomenda: <b>${draftOrder.name}</b>\n` +
+      `👤 Cliente: ${customer_name || '—'}\n` +
+      `📧 Email: ${customer_email}\n` +
+      `💰 Valor: <b>${formatEUR(amount)}</b>\n\n` +
+      `🏦 Entidade: <code>${mb.entity}</code>\n` +
+      `🔢 Referência: <code>${mb.reference}</code>\n\n` +
+      `⏳ <i>A aguardar pagamento...</i>`
+    );
 
     res.json({
       payment_intent_id: paymentIntent.id,
@@ -203,6 +249,15 @@ app.post('/create-multibanco', async (req, res) => {
 
   } catch (err) {
     console.error('Erro:', err.message);
+
+    // 📱 Telegram: Erro ao criar referência
+    await sendTelegramMessage(
+      `❌ <b>Erro ao gerar referência Multibanco</b>\n\n` +
+      `📧 Email: ${req.body?.customer_email || '—'}\n` +
+      `💰 Valor: ${req.body?.amount ? formatEUR(req.body.amount) : '—'}\n\n` +
+      `⚠️ Erro: <code>${err.message}</code>`
+    );
+
     res.status(500).json({ error: err.message });
   }
 });
@@ -258,7 +313,7 @@ async function createShopifyDraftOrder({ customer_email, customer_name, address,
 
   if (!response.ok) {
     const error = await response.text();
-    throw new Error(`Shopify Draft Order erro: ${error}`);
+    throw new Error(`Erro ao criar encomenda: ${error}`);
   }
 
   const data = await response.json();
@@ -277,25 +332,65 @@ app.post('/webhook', async (req, res) => {
   if (event.type === 'payment_intent.succeeded') {
     const pi = event.data.object;
     const draftOrderId = pi.metadata?.shopify_draft_order_id;
+    const draftOrderName = pi.metadata?.shopify_draft_order_name;
+    const customerEmail = pi.metadata?.customer_email;
+    const customerName = pi.metadata?.customer_name;
+    const amount = parseFloat(pi.metadata?.amount) || (pi.amount_received / 100);
+
     if (draftOrderId) {
       console.log(`✅ Pagamento confirmado — a completar encomenda #${draftOrderId}`);
       const order = await completeDraftOrder(draftOrderId, pi.id);
 
       if (order) {
         await sendFacebookPurchaseEvent({
-          email: pi.metadata?.customer_email,
-          amount: parseFloat(pi.metadata?.amount) || (pi.amount_received / 100),
+          email: customerEmail,
+          amount: amount,
           currency: pi.metadata?.currency || pi.currency,
           orderId: draftOrderId,
           orderName: order.name,
         });
+
+        // 📱 Telegram: Pagamento confirmado
+        await sendTelegramMessage(
+          `✅ <b>PAGAMENTO CONFIRMADO</b>\n\n` +
+          `📦 Encomenda: <b>${order.name}</b>\n` +
+          `👤 Cliente: ${customerName || '—'}\n` +
+          `📧 Email: ${customerEmail}\n` +
+          `💰 Valor: <b>${formatEUR(amount)}</b>\n\n` +
+          `🎉 <i>Encomenda criada com sucesso!</i>`
+        );
+      } else {
+        // 📱 Telegram: Pago mas falhou ao criar encomenda
+        await sendTelegramMessage(
+          `⚠️ <b>ATENÇÃO: Pago mas erro a criar encomenda</b>\n\n` +
+          `📦 Draft Order: ${draftOrderName || draftOrderId}\n` +
+          `👤 Cliente: ${customerName || '—'}\n` +
+          `📧 Email: ${customerEmail}\n` +
+          `💰 Valor: <b>${formatEUR(amount)}</b>\n\n` +
+          `🔧 <i>Verifica manualmente no painel!</i>`
+        );
       }
     }
   }
 
   if (event.type === 'payment_intent.payment_failed') {
     const pi = event.data.object;
+    const draftOrderName = pi.metadata?.shopify_draft_order_name;
+    const customerEmail = pi.metadata?.customer_email;
+    const customerName = pi.metadata?.customer_name;
+    const amount = parseFloat(pi.metadata?.amount) || (pi.amount / 100);
+
     console.log(`⏱ Expirou — draft order ${pi.metadata?.shopify_draft_order_id}`);
+
+    // 📱 Telegram: Pagamento falhado/expirado
+    await sendTelegramMessage(
+      `❌ <b>PAGAMENTO FALHADO/EXPIRADO</b>\n\n` +
+      `📦 Encomenda: ${draftOrderName || '—'}\n` +
+      `👤 Cliente: ${customerName || '—'}\n` +
+      `📧 Email: ${customerEmail || '—'}\n` +
+      `💰 Valor: ${formatEUR(amount)}\n\n` +
+      `⏱ <i>O cliente não pagou a tempo</i>`
+    );
   }
 
   res.json({ received: true });
