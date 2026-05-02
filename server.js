@@ -15,39 +15,56 @@ const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
 
 // ===== Telegram =====
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // "1257369605,1441981636" no Railway
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+// ===== Z-API WhatsApp =====
+const ZAPI_INSTANCE_ID = process.env.ZAPI_INSTANCE_ID;
+const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
 
 async function sendTelegramMessage(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.log('⚠️ Telegram não configurado');
-    return;
-  }
-
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   const chatIds = TELEGRAM_CHAT_ID.split(',').map(id => id.trim());
-
   for (const chatId of chatIds) {
     try {
-      const response = await fetch(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: text,
-            parse_mode: 'HTML',
-          }),
-        }
-      );
-      if (!response.ok) {
-        const error = await response.text();
-        console.error(`❌ Telegram erro para ${chatId}:`, error);
-      } else {
-        console.log(`✅ Telegram enviado para ${chatId}`);
-      }
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: 'HTML' }),
+      });
     } catch (err) {
       console.error(`❌ Erro Telegram para ${chatId}:`, err.message);
     }
+  }
+}
+
+async function sendWhatsAppMessage(phone, message) {
+  if (!ZAPI_INSTANCE_ID || !ZAPI_TOKEN) {
+    console.log('⚠️ Z-API não configurado');
+    return;
+  }
+  if (!phone) return;
+
+  let number = phone.replace(/[\s\+\-]/g, '');
+  if (number.startsWith('00')) number = number.slice(2);
+  if (number.startsWith('9') || number.startsWith('2')) number = '351' + number;
+
+  try {
+    const response = await fetch(
+      `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}/send-text`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: number, message: message }),
+      }
+    );
+    const result = await response.json();
+    if (!response.ok) {
+      console.error('❌ Z-API erro:', JSON.stringify(result));
+    } else {
+      console.log(`✅ WhatsApp enviado para ${number}`);
+    }
+  } catch (err) {
+    console.error('❌ Erro WhatsApp:', err.message);
   }
 }
 
@@ -171,7 +188,7 @@ async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orde
 
 app.post('/create-multibanco', async (req, res) => {
   try {
-    const { amount, currency = 'eur', customer_email, customer_name, address, cart_items } = req.body;
+    const { amount, currency = 'eur', customer_email, customer_name, address, cart_items, product_url } = req.body;
 
     if (!amount || !customer_email) {
       return res.status(400).json({ error: 'Faltam campos obrigatórios' });
@@ -196,6 +213,8 @@ app.post('/create-multibanco', async (req, res) => {
         shopify_draft_order_name: draftOrder.name,
         customer_email: customer_email,
         customer_name: customer_name || '',
+        customer_phone: address?.phone || '',
+        product_url: product_url || 'https://www.anadalfama.pt',
         amount: amount,
         currency: currency,
         shop: 'anadalfama.pt',
@@ -205,11 +224,30 @@ app.post('/create-multibanco', async (req, res) => {
     const mb = paymentIntent.next_action?.multibanco_display_details;
     if (!mb) throw new Error('Multibanco não ativado na Stripe.');
 
+    const firstName = (customer_name || '').split(' ')[0] || 'cliente';
+
+    // 📱 WhatsApp → Cliente
+    if (address?.phone) {
+      await sendWhatsAppMessage(address.phone,
+        `Olá ${firstName}! 👋\n\n` +
+        `Obrigada pela tua encomenda na *Ana D'Alfama*! 🛍️\n\n` +
+        `Para finalizar o pagamento usa os seguintes dados:\n\n` +
+        `🏦 *Entidade:* ${mb.entity}\n` +
+        `🔢 *Referência:* ${mb.reference}\n` +
+        `💶 *Valor:* ${formatEUR(amount)}\n\n` +
+        `⏳ Referência válida por 24h — não te esqueças de pagar! 😊\n\n` +
+        `🔗 Ver o teu produto:\n${product_url || 'https://www.anadalfama.pt'}\n\n` +
+        `Qualquer dúvida estamos aqui! ❤️`
+      );
+    }
+
+    // 📱 Telegram → Tu e amigo
     await sendTelegramMessage(
       `🆕 <b>Nova referência Multibanco gerada</b>\n\n` +
       `📦 Encomenda: <b>${draftOrder.name}</b>\n` +
       `👤 Cliente: ${customer_name || '—'}\n` +
       `📧 Email: ${customer_email}\n` +
+      `📱 Telefone: ${address?.phone || '—'}\n` +
       `💰 Valor: <b>${formatEUR(amount)}</b>\n\n` +
       `🏦 Entidade: <code>${mb.entity}</code>\n` +
       `🔢 Referência: <code>${mb.reference}</code>\n\n` +
@@ -307,7 +345,10 @@ app.post('/webhook', async (req, res) => {
     const draftOrderName = pi.metadata?.shopify_draft_order_name;
     const customerEmail = pi.metadata?.customer_email;
     const customerName = pi.metadata?.customer_name;
+    const customerPhone = pi.metadata?.customer_phone;
+    const productUrl = pi.metadata?.product_url;
     const amount = parseFloat(pi.metadata?.amount) || (pi.amount_received / 100);
+    const firstName = (customerName || '').split(' ')[0] || 'cliente';
 
     if (draftOrderId) {
       console.log(`✅ Pagamento confirmado — a completar encomenda #${draftOrderId}`);
@@ -322,6 +363,18 @@ app.post('/webhook', async (req, res) => {
           orderName: order.name,
         });
 
+        // 📱 WhatsApp → Cliente (pagamento confirmado)
+        if (customerPhone) {
+          await sendWhatsAppMessage(customerPhone,
+            `✅ *Pagamento confirmado!*\n\n` +
+            `Olá ${firstName}! A tua encomenda *${order.name}* foi confirmada! 🎉\n\n` +
+            `💶 Valor pago: *${formatEUR(amount)}*\n\n` +
+            `Vamos preparar tudo com muito carinho. Assim que enviarmos recebes uma notificação! 📦❤️\n\n` +
+            `— Ana D'Alfama`
+          );
+        }
+
+        // 📱 Telegram → Tu e amigo
         await sendTelegramMessage(
           `💰❤️ <b>CATCHIN! oldies hit different, bro</b> 💰❤️\n\n` +
           `📦 Encomenda: <b>${order.name}</b>\n` +
