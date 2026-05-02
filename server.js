@@ -17,7 +17,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Cria tabela se não existir
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS followups (
@@ -101,8 +100,6 @@ function formatEUR(amount) {
 // ===== JOB — corre a cada 5 minutos =====
 async function processFollowups() {
   try {
-    const now = new Date();
-
     // 20 minutos
     const res20 = await pool.query(`
       SELECT * FROM followups
@@ -135,14 +132,14 @@ async function processFollowups() {
     `);
     for (const row of res24.rows) {
       await sendWhatsAppMessage(row.phone,
-        `Olá ${row.customer_name}! 👋\n\n` +
-        `Reparámos que a sua encomenda na *Ana D'Alfama* ainda está pendente. 🛍️\n\n` +
-        `Ainda pode finalizar o pagamento com os dados abaixo:\n\n` +
+        `Olá ${row.customer_name}! 💛\n\n` +
+        `Reparámos que ainda não finalizou o pagamento da sua encomenda na *Ana D'Alfama*.\n\n` +
+        `Reservámos o seu produto mas não o conseguimos guardar para sempre! 😊\n\n` +
         `・ Entidade: ${row.entity}\n` +
         `・ Referência: ${row.reference}\n` +
         `・ Valor: ${row.amount}\n\n` +
         `Veja aqui o seu produto:\n${row.product_url || 'https://www.anadalfama.pt'}\n\n` +
-        `Estamos aqui para ajudar! ❤️`
+        `Qualquer dúvida estamos aqui! ❤️`
       );
       await pool.query('UPDATE followups SET sent_24h = TRUE WHERE id = $1', [row.id]);
       console.log(`✅ Follow-up 24h enviado para ${row.phone}`);
@@ -157,9 +154,9 @@ async function processFollowups() {
     `);
     for (const row of res3d.rows) {
       await sendWhatsAppMessage(row.phone,
-        `Olá ${row.customer_name}! 💛\n\n` +
-        `A sua encomenda na *Ana D'Alfama* continua à sua espera! 🛍️\n\n` +
-        `Se tiver alguma dúvida ou precisar de ajuda estamos aqui.\n\n` +
+        `Olá ${row.customer_name}! 🎁\n\n` +
+        `Ainda está a tempo de finalizar a sua encomenda na *Ana D'Alfama*!\n\n` +
+        `Como agradecimento pela sua paciência, use o código *VOLTA10* para 10% de desconto numa próxima compra! 💛\n\n` +
         `Veja aqui o seu produto:\n${row.product_url || 'https://www.anadalfama.pt'}\n\n` +
         `— Ana D'Alfama ❤️`
       );
@@ -172,7 +169,6 @@ async function processFollowups() {
   }
 }
 
-// Corre a cada 5 minutos
 setInterval(processFollowups, 5 * 60 * 1000);
 
 // ===== Shopify Token Management =====
