@@ -15,7 +15,7 @@ const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
 
 // ===== Telegram =====
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // "1257369605,1441981636" no Railway
 
 async function sendTelegramMessage(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -23,28 +23,31 @@ async function sendTelegramMessage(text) {
     return;
   }
 
-  try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: TELEGRAM_CHAT_ID,
-          text: text,
-          parse_mode: 'HTML',
-        }),
-      }
-    );
+  const chatIds = TELEGRAM_CHAT_ID.split(',').map(id => id.trim());
 
-    if (!response.ok) {
-      const error = await response.text();
-      console.error('❌ Telegram erro:', error);
-    } else {
-      console.log('✅ Notificação Telegram enviada');
+  for (const chatId of chatIds) {
+    try {
+      const response = await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: text,
+            parse_mode: 'HTML',
+          }),
+        }
+      );
+      if (!response.ok) {
+        const error = await response.text();
+        console.error(`❌ Telegram erro para ${chatId}:`, error);
+      } else {
+        console.log(`✅ Telegram enviado para ${chatId}`);
+      }
+    } catch (err) {
+      console.error(`❌ Erro Telegram para ${chatId}:`, err.message);
     }
-  } catch (err) {
-    console.error('❌ Erro Telegram:', err.message);
   }
 }
 
@@ -57,15 +60,11 @@ const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN || 'vu1ntd-yz.myshopify.com
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 
-let shopifyTokenCache = {
-  token: null,
-  expires_at: 0,
-};
+let shopifyTokenCache = { token: null, expires_at: 0 };
 let refreshPromise = null;
 
 async function fetchNewShopifyToken() {
   console.log('🔄 A obter novo token Shopify...');
-
   const response = await fetch(
     `https://${SHOPIFY_SHOP}/admin/oauth/access_token`,
     {
@@ -78,44 +77,31 @@ async function fetchNewShopifyToken() {
       }),
     }
   );
-
   if (!response.ok) {
     const error = await response.text();
     throw new Error(`Falha ao obter token Shopify: ${error}`);
   }
-
   const data = await response.json();
-
   shopifyTokenCache = {
     token: data.access_token,
     expires_at: Date.now() + (data.expires_in * 1000),
   };
-
   console.log(`✅ Novo token Shopify obtido — expira em ${Math.round(data.expires_in / 3600)}h`);
   return shopifyTokenCache.token;
 }
 
 async function getShopifyToken() {
   const SAFETY_MARGIN = 5 * 60 * 1000;
-
   if (shopifyTokenCache.token && shopifyTokenCache.expires_at - Date.now() > SAFETY_MARGIN) {
     return shopifyTokenCache.token;
   }
-
-  if (refreshPromise) {
-    return refreshPromise;
-  }
-
-  refreshPromise = fetchNewShopifyToken().finally(() => {
-    refreshPromise = null;
-  });
-
+  if (refreshPromise) return refreshPromise;
+  refreshPromise = fetchNewShopifyToken().finally(() => { refreshPromise = null; });
   return refreshPromise;
 }
 
 async function shopifyFetch(path, options = {}) {
   let token = await getShopifyToken();
-
   let response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
     ...options,
     headers: {
@@ -124,12 +110,10 @@ async function shopifyFetch(path, options = {}) {
       'X-Shopify-Access-Token': token,
     },
   });
-
   if (response.status === 401) {
     console.log('⚠️ Token Shopify rejeitado — a renovar...');
     shopifyTokenCache.expires_at = 0;
     token = await getShopifyToken();
-
     response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
       ...options,
       headers: {
@@ -139,7 +123,6 @@ async function shopifyFetch(path, options = {}) {
       },
     });
   }
-
   return response;
 }
 
@@ -151,25 +134,22 @@ function hashData(value) {
 async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orderId, orderName }) {
   try {
     const eventData = {
-      data: [
-        {
-          event_name: 'Purchase',
-          event_time: Math.floor(Date.now() / 1000),
-          action_source: 'website',
-          event_source_url: 'https://www.anadalfama.pt',
-          user_data: {
-            em: [hashData(email)],
-            country: [hashData('pt')],
-          },
-          custom_data: {
-            currency: currency.toLowerCase(),
-            value: amount,
-            order_id: orderName || orderId,
-          },
+      data: [{
+        event_name: 'Purchase',
+        event_time: Math.floor(Date.now() / 1000),
+        action_source: 'website',
+        event_source_url: 'https://www.anadalfama.pt',
+        user_data: {
+          em: [hashData(email)],
+          country: [hashData('pt')],
         },
-      ],
+        custom_data: {
+          currency: currency.toLowerCase(),
+          value: amount,
+          order_id: orderName || orderId,
+        },
+      }],
     };
-
     const response = await fetch(
       `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
       {
@@ -178,7 +158,6 @@ async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orde
         body: JSON.stringify(eventData),
       }
     );
-
     const result = await response.json();
     if (result.error) {
       console.error('❌ Facebook CAPI erro:', result.error.message);
@@ -226,7 +205,6 @@ app.post('/create-multibanco', async (req, res) => {
     const mb = paymentIntent.next_action?.multibanco_display_details;
     if (!mb) throw new Error('Multibanco não ativado na Stripe.');
 
-    // 📱 Telegram: Referência criada
     await sendTelegramMessage(
       `🆕 <b>Nova referência Multibanco gerada</b>\n\n` +
       `📦 Encomenda: <b>${draftOrder.name}</b>\n` +
@@ -249,15 +227,12 @@ app.post('/create-multibanco', async (req, res) => {
 
   } catch (err) {
     console.error('Erro:', err.message);
-
-    // 📱 Telegram: Erro ao criar referência
     await sendTelegramMessage(
       `❌ <b>Erro ao gerar referência Multibanco</b>\n\n` +
       `📧 Email: ${req.body?.customer_email || '—'}\n` +
       `💰 Valor: ${req.body?.amount ? formatEUR(req.body.amount) : '—'}\n\n` +
       `⚠️ Erro: <code>${err.message}</code>`
     );
-
     res.status(500).json({ error: err.message });
   }
 });
@@ -303,13 +278,10 @@ async function createShopifyDraftOrder({ customer_email, customer_name, address,
     }
   };
 
-  const response = await shopifyFetch(
-    '/admin/api/2024-01/draft_orders.json',
-    {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }
-  );
+  const response = await shopifyFetch('/admin/api/2024-01/draft_orders.json', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
 
   if (!response.ok) {
     const error = await response.text();
@@ -350,47 +322,25 @@ app.post('/webhook', async (req, res) => {
           orderName: order.name,
         });
 
-        // 📱 Telegram: Pagamento confirmado
         await sendTelegramMessage(
-          `✅ <b>PAGAMENTO CONFIRMADO</b>\n\n` +
+          `💰❤️ <b>CATCHIN! oldies hit different, bro</b> 💰❤️\n\n` +
           `📦 Encomenda: <b>${order.name}</b>\n` +
           `👤 Cliente: ${customerName || '—'}\n` +
           `📧 Email: ${customerEmail}\n` +
           `💰 Valor: <b>${formatEUR(amount)}</b>\n\n` +
-          `🎉 <i>Encomenda criada com sucesso!</i>`
+          `✅ <i>Pagamento recebido com sucesso!</i>`
         );
       } else {
-        // 📱 Telegram: Pago mas falhou ao criar encomenda
         await sendTelegramMessage(
-          `⚠️ <b>ATENÇÃO: Pago mas erro a criar encomenda</b>\n\n` +
-          `📦 Draft Order: ${draftOrderName || draftOrderId}\n` +
+          `💰❤️ <b>CATCHIN! oldies hit different, bro</b> 💰❤️\n\n` +
+          `📦 Encomenda: ${draftOrderName || draftOrderId}\n` +
           `👤 Cliente: ${customerName || '—'}\n` +
           `📧 Email: ${customerEmail}\n` +
           `💰 Valor: <b>${formatEUR(amount)}</b>\n\n` +
-          `🔧 <i>Verifica manualmente no painel!</i>`
+          `✅ <i>Pagamento recebido com sucesso!</i>`
         );
       }
     }
-  }
-
-  if (event.type === 'payment_intent.payment_failed') {
-    const pi = event.data.object;
-    const draftOrderName = pi.metadata?.shopify_draft_order_name;
-    const customerEmail = pi.metadata?.customer_email;
-    const customerName = pi.metadata?.customer_name;
-    const amount = parseFloat(pi.metadata?.amount) || (pi.amount / 100);
-
-    console.log(`⏱ Expirou — draft order ${pi.metadata?.shopify_draft_order_id}`);
-
-    // 📱 Telegram: Pagamento falhado/expirado
-    await sendTelegramMessage(
-      `❌ <b>PAGAMENTO FALHADO/EXPIRADO</b>\n\n` +
-      `📦 Encomenda: ${draftOrderName || '—'}\n` +
-      `👤 Cliente: ${customerName || '—'}\n` +
-      `📧 Email: ${customerEmail || '—'}\n` +
-      `💰 Valor: ${formatEUR(amount)}\n\n` +
-      `⏱ <i>O cliente não pagou a tempo</i>`
-    );
   }
 
   res.json({ received: true });
@@ -402,12 +352,10 @@ async function completeDraftOrder(draftOrderId, paymentIntentId) {
       `/admin/api/2024-01/draft_orders/${draftOrderId}/complete.json?payment_gateway=multibanco&payment_pending=false`,
       { method: 'PUT' }
     );
-
     if (!response.ok) {
       const error = await response.text();
       throw new Error(`Erro ao completar draft order: ${error}`);
     }
-
     const data = await response.json();
     console.log(`✅ Encomenda ${data.order?.name} criada!`);
     return data.order;
