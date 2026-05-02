@@ -4,19 +4,48 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY, {
 });
 const cors = require('cors');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
 const app = express();
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(cors());
 
+// ===== PostgreSQL =====
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// Cria tabela se não existir
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS followups (
+      id SERIAL PRIMARY KEY,
+      phone TEXT NOT NULL,
+      customer_name TEXT,
+      entity TEXT,
+      reference TEXT,
+      amount TEXT,
+      morada TEXT,
+      product_url TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      sent_20min BOOLEAN DEFAULT FALSE,
+      sent_24h BOOLEAN DEFAULT FALSE,
+      sent_3days BOOLEAN DEFAULT FALSE,
+      paid BOOLEAN DEFAULT FALSE
+    )
+  `);
+  console.log('✅ Base de dados pronta');
+}
+
 const FB_PIXEL_ID = '753350047833434';
 const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
-
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const ZAPI_INSTANCE_ID = process.env.ZAPI_INSTANCE_ID;
 const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
+const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN;
 
 async function sendTelegramMessage(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -35,10 +64,7 @@ async function sendTelegramMessage(text) {
 }
 
 async function sendWhatsAppMessage(phone, message) {
-  if (!ZAPI_INSTANCE_ID || !ZAPI_TOKEN) {
-    console.log('⚠️ Z-API não configurado');
-    return;
-  }
+  if (!ZAPI_INSTANCE_ID || !ZAPI_TOKEN) return;
   if (!phone) return;
 
   let number = phone.replace(/[\s\+\-]/g, '');
@@ -50,7 +76,10 @@ async function sendWhatsAppMessage(phone, message) {
       `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}/send-text`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Client-Token': ZAPI_CLIENT_TOKEN,
+        },
         body: JSON.stringify({ phone: number, message: message }),
       }
     );
@@ -69,6 +98,84 @@ function formatEUR(amount) {
   return `${parseFloat(amount).toFixed(2)} €`;
 }
 
+// ===== JOB — corre a cada 5 minutos =====
+async function processFollowups() {
+  try {
+    const now = new Date();
+
+    // 20 minutos
+    const res20 = await pool.query(`
+      SELECT * FROM followups
+      WHERE paid = FALSE
+      AND sent_20min = FALSE
+      AND created_at <= NOW() - INTERVAL '20 minutes'
+    `);
+    for (const row of res20.rows) {
+      await sendWhatsAppMessage(row.phone,
+        `Olá ${row.customer_name}! 👋\n\n` +
+        `Obrigada pela sua encomenda na *Ana D'Alfama*! 🛍️\n\n` +
+        `Para finalizar o seu pagamento use os seguintes dados:\n\n` +
+        `・ Entidade: ${row.entity}\n` +
+        `・ Referência: ${row.reference}\n` +
+        `・ Valor: ${row.amount}\n` +
+        `・ Morada: ${row.morada || '—'}\n\n` +
+        `Veja aqui o seu produto:\n${row.product_url || 'https://www.anadalfama.pt'}\n\n` +
+        `Qualquer dúvida estamos aqui! ❤️`
+      );
+      await pool.query('UPDATE followups SET sent_20min = TRUE WHERE id = $1', [row.id]);
+      console.log(`✅ Follow-up 20min enviado para ${row.phone}`);
+    }
+
+    // 24 horas
+    const res24 = await pool.query(`
+      SELECT * FROM followups
+      WHERE paid = FALSE
+      AND sent_24h = FALSE
+      AND created_at <= NOW() - INTERVAL '24 hours'
+    `);
+    for (const row of res24.rows) {
+      await sendWhatsAppMessage(row.phone,
+        `Olá ${row.customer_name}! 👋\n\n` +
+        `Reparámos que a sua encomenda na *Ana D'Alfama* ainda está pendente. 🛍️\n\n` +
+        `Ainda pode finalizar o pagamento com os dados abaixo:\n\n` +
+        `・ Entidade: ${row.entity}\n` +
+        `・ Referência: ${row.reference}\n` +
+        `・ Valor: ${row.amount}\n\n` +
+        `Veja aqui o seu produto:\n${row.product_url || 'https://www.anadalfama.pt'}\n\n` +
+        `Estamos aqui para ajudar! ❤️`
+      );
+      await pool.query('UPDATE followups SET sent_24h = TRUE WHERE id = $1', [row.id]);
+      console.log(`✅ Follow-up 24h enviado para ${row.phone}`);
+    }
+
+    // 3 dias
+    const res3d = await pool.query(`
+      SELECT * FROM followups
+      WHERE paid = FALSE
+      AND sent_3days = FALSE
+      AND created_at <= NOW() - INTERVAL '3 days'
+    `);
+    for (const row of res3d.rows) {
+      await sendWhatsAppMessage(row.phone,
+        `Olá ${row.customer_name}! 💛\n\n` +
+        `A sua encomenda na *Ana D'Alfama* continua à sua espera! 🛍️\n\n` +
+        `Se tiver alguma dúvida ou precisar de ajuda estamos aqui.\n\n` +
+        `Veja aqui o seu produto:\n${row.product_url || 'https://www.anadalfama.pt'}\n\n` +
+        `— Ana D'Alfama ❤️`
+      );
+      await pool.query('UPDATE followups SET sent_3days = TRUE WHERE id = $1', [row.id]);
+      console.log(`✅ Follow-up 3 dias enviado para ${row.phone}`);
+    }
+
+  } catch (err) {
+    console.error('❌ Erro no job de follow-ups:', err.message);
+  }
+}
+
+// Corre a cada 5 minutos
+setInterval(processFollowups, 5 * 60 * 1000);
+
+// ===== Shopify Token Management =====
 const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN || 'vu1ntd-yz.myshopify.com';
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
@@ -78,18 +185,15 @@ let refreshPromise = null;
 
 async function fetchNewShopifyToken() {
   console.log('🔄 A obter novo token Shopify...');
-  const response = await fetch(
-    `https://${SHOPIFY_SHOP}/admin/oauth/access_token`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'client_credentials',
-        client_id: SHOPIFY_CLIENT_ID,
-        client_secret: SHOPIFY_CLIENT_SECRET,
-      }),
-    }
-  );
+  const response = await fetch(`https://${SHOPIFY_SHOP}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'client_credentials',
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+    }),
+  });
   if (!response.ok) {
     const error = await response.text();
     throw new Error(`Falha ao obter token Shopify: ${error}`);
@@ -99,7 +203,7 @@ async function fetchNewShopifyToken() {
     token: data.access_token,
     expires_at: Date.now() + (data.expires_in * 1000),
   };
-  console.log(`✅ Novo token Shopify obtido — expira em ${Math.round(data.expires_in / 3600)}h`);
+  console.log(`✅ Novo token Shopify obtido`);
   return shopifyTokenCache.token;
 }
 
@@ -117,23 +221,14 @@ async function shopifyFetch(path, options = {}) {
   let token = await getShopifyToken();
   let response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
     ...options,
-    headers: {
-      ...options.headers,
-      'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': token,
-    },
+    headers: { ...options.headers, 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
   });
   if (response.status === 401) {
-    console.log('⚠️ Token Shopify rejeitado — a renovar...');
     shopifyTokenCache.expires_at = 0;
     token = await getShopifyToken();
     response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
       ...options,
-      headers: {
-        ...options.headers,
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token,
-      },
+      headers: { ...options.headers, 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
     });
   }
   return response;
@@ -152,33 +247,19 @@ async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orde
         event_time: Math.floor(Date.now() / 1000),
         action_source: 'website',
         event_source_url: 'https://www.anadalfama.pt',
-        user_data: {
-          em: [hashData(email)],
-          country: [hashData('pt')],
-        },
-        custom_data: {
-          currency: currency.toLowerCase(),
-          value: amount,
-          order_id: orderName || orderId,
-        },
+        user_data: { em: [hashData(email)], country: [hashData('pt')] },
+        custom_data: { currency: currency.toLowerCase(), value: amount, order_id: orderName || orderId },
       }],
     };
     const response = await fetch(
       `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(eventData),
-      }
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(eventData) }
     );
     const result = await response.json();
-    if (result.error) {
-      console.error('❌ Facebook CAPI erro:', result.error.message);
-    } else {
-      console.log(`✅ Facebook Purchase enviado — order ${orderName}, valor ${amount} ${currency}`);
-    }
+    if (result.error) console.error('❌ Facebook CAPI erro:', result.error.message);
+    else console.log(`✅ Facebook Purchase enviado — order ${orderName}`);
   } catch (err) {
-    console.error('❌ Erro ao enviar evento Facebook:', err.message);
+    console.error('❌ Erro Facebook:', err.message);
   }
 }
 
@@ -207,12 +288,12 @@ app.post('/create-multibanco', async (req, res) => {
       metadata: {
         shopify_draft_order_id: draftOrder.id,
         shopify_draft_order_name: draftOrder.name,
-        customer_email: customer_email,
+        customer_email,
         customer_name: customer_name || '',
         customer_phone: address?.phone || '',
         product_url: product_url || 'https://www.anadalfama.pt',
-        amount: amount,
-        currency: currency,
+        amount,
+        currency,
         shop: 'anadalfama.pt',
       },
     });
@@ -220,28 +301,25 @@ app.post('/create-multibanco', async (req, res) => {
     const mb = paymentIntent.next_action?.multibanco_display_details;
     if (!mb) throw new Error('Multibanco não ativado na Stripe.');
 
-    // 📱 WhatsApp → Cliente (referência gerada)
-    if (address?.phone) {
-      const morada = [
-        address?.address1,
-        address?.city,
-        address?.zip,
-      ].filter(Boolean).join(', ');
+    const morada = [address?.address1, address?.city, address?.zip].filter(Boolean).join(', ');
 
-      await sendWhatsAppMessage(address.phone,
-        `Olá ${customer_name}! 👋\n\n` +
-        `Obrigada pela sua encomenda na *Ana D'Alfama*! 🛍️\n\n` +
-        `Para finalizar o seu pagamento use os seguintes dados:\n\n` +
-        `・ Entidade: ${mb.entity}\n` +
-        `・ Referência: ${mb.reference}\n` +
-        `・ Valor: ${formatEUR(amount)}\n` +
-        `・ Morada: ${morada || '—'}\n\n` +
-        `Veja aqui o seu produto:\n${product_url || 'https://www.anadalfama.pt'}\n\n` +
-        `Qualquer dúvida estamos aqui! ❤️`
-      );
+    // Guarda na base de dados para follow-ups
+    if (address?.phone) {
+      await pool.query(`
+        INSERT INTO followups (phone, customer_name, entity, reference, amount, morada, product_url)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `, [
+        address.phone,
+        customer_name || '',
+        mb.entity,
+        mb.reference,
+        formatEUR(amount),
+        morada,
+        product_url || 'https://www.anadalfama.pt',
+      ]);
     }
 
-    // 📱 Telegram → Tu e amigo
+    // Telegram → Tu e amigo
     await sendTelegramMessage(
       `🆕 <b>Nova referência Multibanco gerada</b>\n\n` +
       `📦 Encomenda: <b>${draftOrder.name}</b>\n` +
@@ -258,7 +336,7 @@ app.post('/create-multibanco', async (req, res) => {
       payment_intent_id: paymentIntent.id,
       entity: mb.entity,
       reference: mb.reference,
-      amount: amount,
+      amount,
       expires_at: mb.expires_at,
       order_name: draftOrder.name,
     });
@@ -280,45 +358,30 @@ async function createShopifyDraftOrder({ customer_email, customer_name, address,
   const firstName = nameParts[0] || '';
   const lastName = nameParts.slice(1).join(' ') || '';
 
-  const lineItems = cart_items?.map(item => ({
-    variant_id: item.variant_id,
-    quantity: item.quantity,
-  })) || [];
+  const lineItems = cart_items?.map(item => ({ variant_id: item.variant_id, quantity: item.quantity })) || [];
 
   const body = {
     draft_order: {
       line_items: lineItems,
       customer: { email: customer_email },
       shipping_address: {
-        first_name: firstName,
-        last_name: lastName,
-        address1: address?.address1 || '',
-        city: address?.city || '',
-        zip: address?.zip || '',
-        country: address?.country || 'PT',
-        phone: address?.phone || '',
+        first_name: firstName, last_name: lastName,
+        address1: address?.address1 || '', city: address?.city || '',
+        zip: address?.zip || '', country: address?.country || 'PT', phone: address?.phone || '',
       },
       billing_address: {
-        first_name: firstName,
-        last_name: lastName,
-        address1: address?.address1 || '',
-        city: address?.city || '',
-        zip: address?.zip || '',
-        country: address?.country || 'PT',
+        first_name: firstName, last_name: lastName,
+        address1: address?.address1 || '', city: address?.city || '',
+        zip: address?.zip || '', country: address?.country || 'PT',
       },
-      shipping_line: {
-        title: 'Envio Standard',
-        price: '0.00',
-        code: 'envio-standard',
-      },
+      shipping_line: { title: 'Envio Standard', price: '0.00', code: 'envio-standard' },
       tags: 'multibanco,aguarda-pagamento',
       note: 'Pagamento por Multibanco — aguarda confirmação',
     }
   };
 
   const response = await shopifyFetch('/admin/api/2024-01/draft_orders.json', {
-    method: 'POST',
-    body: JSON.stringify(body),
+    method: 'POST', body: JSON.stringify(body),
   });
 
   if (!response.ok) {
@@ -348,20 +411,21 @@ app.post('/webhook', async (req, res) => {
     const customerPhone = pi.metadata?.customer_phone;
     const amount = parseFloat(pi.metadata?.amount) || (pi.amount_received / 100);
 
+    // Marca como pago na base de dados
+    if (customerPhone) {
+      await pool.query('UPDATE followups SET paid = TRUE WHERE phone = $1 AND paid = FALSE', [customerPhone]);
+    }
+
     if (draftOrderId) {
-      console.log(`✅ Pagamento confirmado — a completar encomenda #${draftOrderId}`);
       const order = await completeDraftOrder(draftOrderId, pi.id);
 
       if (order) {
         await sendFacebookPurchaseEvent({
-          email: customerEmail,
-          amount: amount,
-          currency: pi.metadata?.currency || pi.currency,
-          orderId: draftOrderId,
-          orderName: order.name,
+          email: customerEmail, amount, currency: pi.metadata?.currency || pi.currency,
+          orderId: draftOrderId, orderName: order.name,
         });
 
-        // 📱 WhatsApp → Cliente (pagamento confirmado)
+        // WhatsApp → Cliente (pagamento confirmado)
         if (customerPhone) {
           await sendWhatsAppMessage(customerPhone,
             `✅ *Pagamento confirmado!*\n\n` +
@@ -372,7 +436,7 @@ app.post('/webhook', async (req, res) => {
           );
         }
 
-        // 📱 Telegram → Tu e amigo
+        // Telegram → Tu e amigo
         await sendTelegramMessage(
           `💰❤️ <b>CATCHIN! oldies hit different, bro</b> 💰❤️\n\n` +
           `📦 Encomenda: <b>${order.name}</b>\n` +
@@ -419,4 +483,8 @@ async function completeDraftOrder(draftOrderId, paymentIntentId) {
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'Ana Dalfama — Multibanco Server' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Porta ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`🚀 Porta ${PORT}`);
+  await initDB();
+  processFollowups();
+});
