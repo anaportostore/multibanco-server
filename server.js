@@ -13,11 +13,8 @@ app.use(cors());
 const FB_PIXEL_ID = '753350047833434';
 const FB_ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
 
-// ===== Telegram =====
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-// ===== Z-API WhatsApp =====
 const ZAPI_INSTANCE_ID = process.env.ZAPI_INSTANCE_ID;
 const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
 
@@ -72,7 +69,6 @@ function formatEUR(amount) {
   return `${parseFloat(amount).toFixed(2)} €`;
 }
 
-// ===== Shopify Token Management =====
 const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN || 'vu1ntd-yz.myshopify.com';
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
@@ -224,19 +220,23 @@ app.post('/create-multibanco', async (req, res) => {
     const mb = paymentIntent.next_action?.multibanco_display_details;
     if (!mb) throw new Error('Multibanco não ativado na Stripe.');
 
-    const firstName = (customer_name || '').split(' ')[0] || 'cliente';
-
-    // 📱 WhatsApp → Cliente
+    // 📱 WhatsApp → Cliente (referência gerada)
     if (address?.phone) {
+      const morada = [
+        address?.address1,
+        address?.city,
+        address?.zip,
+      ].filter(Boolean).join(', ');
+
       await sendWhatsAppMessage(address.phone,
-        `Olá ${firstName}! 👋\n\n` +
-        `Obrigada pela tua encomenda na *Ana D'Alfama*! 🛍️\n\n` +
-        `Para finalizar o pagamento usa os seguintes dados:\n\n` +
-        `🏦 *Entidade:* ${mb.entity}\n` +
-        `🔢 *Referência:* ${mb.reference}\n` +
-        `💶 *Valor:* ${formatEUR(amount)}\n\n` +
-        `⏳ Referência válida por 24h — não te esqueças de pagar! 😊\n\n` +
-        `🔗 Ver o teu produto:\n${product_url || 'https://www.anadalfama.pt'}\n\n` +
+        `Olá ${customer_name}! 👋\n\n` +
+        `Obrigada pela sua encomenda na *Ana D'Alfama*! 🛍️\n\n` +
+        `Para finalizar o seu pagamento use os seguintes dados:\n\n` +
+        `・ Entidade: ${mb.entity}\n` +
+        `・ Referência: ${mb.reference}\n` +
+        `・ Valor: ${formatEUR(amount)}\n` +
+        `・ Morada: ${morada || '—'}\n\n` +
+        `Veja aqui o seu produto:\n${product_url || 'https://www.anadalfama.pt'}\n\n` +
         `Qualquer dúvida estamos aqui! ❤️`
       );
     }
@@ -346,9 +346,7 @@ app.post('/webhook', async (req, res) => {
     const customerEmail = pi.metadata?.customer_email;
     const customerName = pi.metadata?.customer_name;
     const customerPhone = pi.metadata?.customer_phone;
-    const productUrl = pi.metadata?.product_url;
     const amount = parseFloat(pi.metadata?.amount) || (pi.amount_received / 100);
-    const firstName = (customerName || '').split(' ')[0] || 'cliente';
 
     if (draftOrderId) {
       console.log(`✅ Pagamento confirmado — a completar encomenda #${draftOrderId}`);
@@ -367,9 +365,9 @@ app.post('/webhook', async (req, res) => {
         if (customerPhone) {
           await sendWhatsAppMessage(customerPhone,
             `✅ *Pagamento confirmado!*\n\n` +
-            `Olá ${firstName}! A tua encomenda *${order.name}* foi confirmada! 🎉\n\n` +
-            `💶 Valor pago: *${formatEUR(amount)}*\n\n` +
-            `Vamos preparar tudo com muito carinho. Assim que enviarmos recebes uma notificação! 📦❤️\n\n` +
+            `Olá ${customerName}! A sua encomenda *${order.name}* foi confirmada! 🎉\n\n` +
+            `・ Valor pago: ${formatEUR(amount)}\n\n` +
+            `Vamos preparar tudo com muito carinho. 📦❤️\n\n` +
             `— Ana D'Alfama`
           );
         }
