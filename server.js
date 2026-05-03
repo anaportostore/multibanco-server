@@ -11,6 +11,9 @@ app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(cors());
 
+// ===== BLACKLIST — nunca enviar para estes números =====
+const BLACKLIST = ['351967870703', '351933496052'];
+
 // ===== PostgreSQL =====
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -88,6 +91,12 @@ async function sendWhatsAppMessage(phone, message) {
   if (number.startsWith('00')) number = number.slice(2);
   if (number.startsWith('9') || number.startsWith('2')) number = '351' + number;
 
+  // Verifica blacklist
+  if (BLACKLIST.includes(number)) {
+    console.log(`⛔ Número na blacklist — não enviado: ${number}`);
+    return;
+  }
+
   try {
     const response = await fetch(
       `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}/send-text`,
@@ -143,7 +152,8 @@ async function processFollowups() {
         `・ Valor: ${row.amount}\n` +
         `・ Morada: ${row.morada || '—'}\n\n` +
         `Veja aqui o seu produto:\n${row.product_url || 'https://www.anadalfama.pt'}\n\n` +
-        `Qualquer dúvida estamos aqui! ❤️`
+        `Qualquer dúvida estamos aqui! ❤️\n\n` +
+        `— Ana D'Alfama`
       );
       await pool.query('UPDATE followups SET sent_20min = TRUE WHERE id = $1', [row.id]);
       console.log(`✅ MB 20min → ${row.phone}`);
@@ -164,7 +174,8 @@ async function processFollowups() {
         `・ Referência: ${row.reference}\n` +
         `・ Valor: ${row.amount}\n\n` +
         `Veja aqui o seu produto:\n${row.product_url || 'https://www.anadalfama.pt'}\n\n` +
-        `Qualquer dúvida estamos aqui! ❤️`
+        `Qualquer dúvida estamos aqui! ❤️\n\n` +
+        `— Ana D'Alfama`
       );
       await pool.query('UPDATE followups SET sent_24h = TRUE WHERE id = $1', [row.id]);
       console.log(`✅ MB 24h → ${row.phone}`);
@@ -246,6 +257,7 @@ async function processAbandonedCarts() {
       `, [checkoutId, phone, fullName, email, morada, checkoutUrl, new Date(checkout.created_at)]);
     }
 
+    // 20 minutos
     const res20 = await pool.query(`
       SELECT * FROM abandoned_carts
       WHERE converted = FALSE AND sent_20min = FALSE
@@ -254,18 +266,20 @@ async function processAbandonedCarts() {
     for (const row of res20.rows) {
       await sendWhatsAppMessage(row.phone,
         `Olá ${row.customer_name}!\n\n` +
-        `Já temos tudo preparado para si, só falta um clique! 🛍️\n\n` +
+        `Na Ana D'Alfama já temos tudo preparado para si, só falta um clique! 🛍️\n\n` +
         `・ Nome: ${row.customer_name}\n` +
         `・ Email: ${row.email}\n` +
         `・ Morada: ${row.morada}\n\n` +
-        `Veja aqui a sua encomenda:\n${row.checkout_url}\n\n` +
-        `Qualquer dúvida estamos aqui! ❤️`
+        `👉 Finalizar encomenda:\n${row.checkout_url}\n\n` +
+        `Qualquer dúvida estamos aqui! ❤️\n\n` +
+        `— Ana D'Alfama`
       );
       await pool.query('UPDATE abandoned_carts SET sent_20min = TRUE WHERE id = $1', [row.id]);
       console.log(`✅ Carrinho 20min → ${row.phone}`);
       await sleep(randomDelay());
     }
 
+    // 24 horas
     const res24 = await pool.query(`
       SELECT * FROM abandoned_carts
       WHERE converted = FALSE AND sent_24h = FALSE
@@ -280,7 +294,7 @@ async function processAbandonedCarts() {
         `・ Morada: ${row.morada}\n\n` +
         `Os produtos que escolheu têm muita procura e não garantimos stock por muito mais tempo. 😊\n\n` +
         `Como agradecimento pela sua visita, use o código *VOLTA5* para 5% de desconto! 💛\n\n` +
-        `Veja aqui a sua encomenda:\n${row.checkout_url}\n\n` +
+        `👉 Finalizar encomenda:\n${row.checkout_url}\n\n` +
         `— Ana D'Alfama ❤️`
       );
       await pool.query('UPDATE abandoned_carts SET sent_24h = TRUE WHERE id = $1', [row.id]);
@@ -288,6 +302,7 @@ async function processAbandonedCarts() {
       await sleep(randomDelay());
     }
 
+    // 3 dias
     const res3d = await pool.query(`
       SELECT * FROM abandoned_carts
       WHERE converted = FALSE AND sent_3days = FALSE
@@ -301,7 +316,7 @@ async function processAbandonedCarts() {
         `・ Email: ${row.email}\n` +
         `・ Morada: ${row.morada}\n\n` +
         `Use o código *VOLTA10* para 10% de desconto! 💛\n\n` +
-        `Veja aqui a sua encomenda:\n${row.checkout_url}\n\n` +
+        `👉 Finalizar encomenda:\n${row.checkout_url}\n\n` +
         `— Ana D'Alfama ❤️`
       );
       await pool.query('UPDATE abandoned_carts SET sent_3days = TRUE WHERE id = $1', [row.id]);
