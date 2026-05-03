@@ -35,6 +35,24 @@ async function initDB() {
       paid BOOLEAN DEFAULT FALSE
     )
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS abandoned_carts (
+      id SERIAL PRIMARY KEY,
+      checkout_id TEXT UNIQUE NOT NULL,
+      phone TEXT NOT NULL,
+      customer_name TEXT,
+      email TEXT,
+      morada TEXT,
+      checkout_url TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      sent_20min BOOLEAN DEFAULT FALSE,
+      sent_24h BOOLEAN DEFAULT FALSE,
+      sent_3days BOOLEAN DEFAULT FALSE,
+      converted BOOLEAN DEFAULT FALSE
+    )
+  `);
+
   console.log('✅ Base de dados pronta');
 }
 
@@ -93,23 +111,31 @@ async function sendWhatsAppMessage(phone, message) {
   }
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function randomDelay() {
+  const delays = [5, 10, 5, 5, 10];
+  const minutes = delays[Math.floor(Math.random() * delays.length)];
+  return minutes * 60 * 1000;
+}
+
 function formatEUR(amount) {
   return `${parseFloat(amount).toFixed(2)} €`;
 }
 
-// ===== JOB — corre a cada 5 minutos =====
+// ===== JOB MULTIBANCO =====
 async function processFollowups() {
   try {
-    // 20 minutos
     const res20 = await pool.query(`
       SELECT * FROM followups
-      WHERE paid = FALSE
-      AND sent_20min = FALSE
+      WHERE paid = FALSE AND sent_20min = FALSE
       AND created_at <= NOW() - INTERVAL '20 minutes'
     `);
     for (const row of res20.rows) {
       await sendWhatsAppMessage(row.phone,
-        `Olá ${row.customer_name}! 👋\n\n` +
+        `Olá ${row.customer_name}!\n\n` +
         `Obrigada pela sua encomenda na *Ana D'Alfama*! 🛍️\n\n` +
         `Para finalizar o seu pagamento use os seguintes dados:\n\n` +
         `・ Entidade: ${row.entity}\n` +
@@ -120,19 +146,18 @@ async function processFollowups() {
         `Qualquer dúvida estamos aqui! ❤️`
       );
       await pool.query('UPDATE followups SET sent_20min = TRUE WHERE id = $1', [row.id]);
-      console.log(`✅ Follow-up 20min enviado para ${row.phone}`);
+      console.log(`✅ MB 20min → ${row.phone}`);
+      await sleep(randomDelay());
     }
 
-    // 24 horas
     const res24 = await pool.query(`
       SELECT * FROM followups
-      WHERE paid = FALSE
-      AND sent_24h = FALSE
+      WHERE paid = FALSE AND sent_24h = FALSE
       AND created_at <= NOW() - INTERVAL '24 hours'
     `);
     for (const row of res24.rows) {
       await sendWhatsAppMessage(row.phone,
-        `Olá ${row.customer_name}! 💛\n\n` +
+        `Olá ${row.customer_name}!\n\n` +
         `Reparámos que ainda não finalizou o pagamento da sua encomenda na *Ana D'Alfama*.\n\n` +
         `Reservámos o seu produto mas não o conseguimos guardar para sempre! 😊\n\n` +
         `・ Entidade: ${row.entity}\n` +
@@ -142,34 +167,166 @@ async function processFollowups() {
         `Qualquer dúvida estamos aqui! ❤️`
       );
       await pool.query('UPDATE followups SET sent_24h = TRUE WHERE id = $1', [row.id]);
-      console.log(`✅ Follow-up 24h enviado para ${row.phone}`);
+      console.log(`✅ MB 24h → ${row.phone}`);
+      await sleep(randomDelay());
     }
 
-    // 3 dias
     const res3d = await pool.query(`
       SELECT * FROM followups
-      WHERE paid = FALSE
-      AND sent_3days = FALSE
+      WHERE paid = FALSE AND sent_3days = FALSE
       AND created_at <= NOW() - INTERVAL '3 days'
     `);
     for (const row of res3d.rows) {
       await sendWhatsAppMessage(row.phone,
-        `Olá ${row.customer_name}! 🎁\n\n` +
+        `Olá ${row.customer_name}!\n\n` +
         `Ainda está a tempo de finalizar a sua encomenda na *Ana D'Alfama*!\n\n` +
-        `Como agradecimento pela sua paciência, use o código *VOLTA10* para 10% de desconto numa próxima compra! 💛\n\n` +
+        `Como agradecimento pela sua paciência, use o código *VOLTA10* para 10% de desconto! 💛\n\n` +
         `Veja aqui o seu produto:\n${row.product_url || 'https://www.anadalfama.pt'}\n\n` +
         `— Ana D'Alfama ❤️`
       );
       await pool.query('UPDATE followups SET sent_3days = TRUE WHERE id = $1', [row.id]);
-      console.log(`✅ Follow-up 3 dias enviado para ${row.phone}`);
+      console.log(`✅ MB 3 dias → ${row.phone}`);
+      await sleep(randomDelay());
     }
 
   } catch (err) {
-    console.error('❌ Erro no job de follow-ups:', err.message);
+    console.error('❌ Erro followups MB:', err.message);
   }
 }
 
-setInterval(processFollowups, 5 * 60 * 1000);
+// ===== JOB CARRINHO ABANDONADO =====
+async function getAbandonedCheckouts() {
+  try {
+    const threeWeeksAgo = new Date();
+    threeWeeksAgo.setDate(threeWeeksAgo.getDate() - 21);
+    const dateFilter = threeWeeksAgo.toISOString();
+
+    const response = await shopifyFetch(
+      `/admin/api/2024-01/checkouts.json?status=open&limit=250&created_at_min=${dateFilter}`
+    );
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.checkouts || [];
+  } catch (err) {
+    console.error('❌ Erro ao buscar checkouts:', err.message);
+    return [];
+  }
+}
+
+async function processAbandonedCarts() {
+  try {
+    const checkouts = await getAbandonedCheckouts();
+
+    for (const checkout of checkouts) {
+      const phone = checkout.shipping_address?.phone || checkout.billing_address?.phone;
+      if (!phone) continue;
+
+      const email = checkout.email || '—';
+      const firstName = checkout.shipping_address?.first_name || '';
+      const lastName = checkout.shipping_address?.last_name || '';
+      const fullName = `${firstName} ${lastName}`.trim() || 'cliente';
+      const morada = [
+        checkout.shipping_address?.address1,
+        checkout.shipping_address?.city,
+        checkout.shipping_address?.zip,
+      ].filter(Boolean).join(', ') || '—';
+      const checkoutUrl = checkout.abandoned_checkout_url || 'https://www.anadalfama.pt';
+      const checkoutId = checkout.id.toString();
+
+      const mbCheck = await pool.query(
+        'SELECT id FROM followups WHERE phone = $1 AND paid = FALSE',
+        [phone]
+      );
+      if (mbCheck.rows.length > 0) continue;
+
+      await pool.query(`
+        INSERT INTO abandoned_carts (checkout_id, phone, customer_name, email, morada, checkout_url, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (checkout_id) DO NOTHING
+      `, [checkoutId, phone, fullName, email, morada, checkoutUrl, new Date(checkout.created_at)]);
+    }
+
+    const res20 = await pool.query(`
+      SELECT * FROM abandoned_carts
+      WHERE converted = FALSE AND sent_20min = FALSE
+      AND created_at <= NOW() - INTERVAL '20 minutes'
+    `);
+    for (const row of res20.rows) {
+      await sendWhatsAppMessage(row.phone,
+        `Olá ${row.customer_name}!\n\n` +
+        `Já temos tudo preparado para si, só falta um clique! 🛍️\n\n` +
+        `・ Nome: ${row.customer_name}\n` +
+        `・ Email: ${row.email}\n` +
+        `・ Morada: ${row.morada}\n\n` +
+        `Veja aqui a sua encomenda:\n${row.checkout_url}\n\n` +
+        `Qualquer dúvida estamos aqui! ❤️`
+      );
+      await pool.query('UPDATE abandoned_carts SET sent_20min = TRUE WHERE id = $1', [row.id]);
+      console.log(`✅ Carrinho 20min → ${row.phone}`);
+      await sleep(randomDelay());
+    }
+
+    const res24 = await pool.query(`
+      SELECT * FROM abandoned_carts
+      WHERE converted = FALSE AND sent_24h = FALSE
+      AND created_at <= NOW() - INTERVAL '24 hours'
+    `);
+    for (const row of res24.rows) {
+      await sendWhatsAppMessage(row.phone,
+        `Olá ${row.customer_name}!\n\n` +
+        `O seu carrinho na *Ana D'Alfama* ainda está à sua espera! ⏳\n\n` +
+        `・ Nome: ${row.customer_name}\n` +
+        `・ Email: ${row.email}\n` +
+        `・ Morada: ${row.morada}\n\n` +
+        `Os produtos que escolheu têm muita procura e não garantimos stock por muito mais tempo. 😊\n\n` +
+        `Como agradecimento pela sua visita, use o código *VOLTA5* para 5% de desconto! 💛\n\n` +
+        `Veja aqui a sua encomenda:\n${row.checkout_url}\n\n` +
+        `— Ana D'Alfama ❤️`
+      );
+      await pool.query('UPDATE abandoned_carts SET sent_24h = TRUE WHERE id = $1', [row.id]);
+      console.log(`✅ Carrinho 24h → ${row.phone}`);
+      await sleep(randomDelay());
+    }
+
+    const res3d = await pool.query(`
+      SELECT * FROM abandoned_carts
+      WHERE converted = FALSE AND sent_3days = FALSE
+      AND created_at <= NOW() - INTERVAL '3 days'
+    `);
+    for (const row of res3d.rows) {
+      await sendWhatsAppMessage(row.phone,
+        `Olá ${row.customer_name}!\n\n` +
+        `Ainda está a tempo de garantir a sua encomenda na *Ana D'Alfama*! 🎁\n\n` +
+        `・ Nome: ${row.customer_name}\n` +
+        `・ Email: ${row.email}\n` +
+        `・ Morada: ${row.morada}\n\n` +
+        `Use o código *VOLTA10* para 10% de desconto! 💛\n\n` +
+        `Veja aqui a sua encomenda:\n${row.checkout_url}\n\n` +
+        `— Ana D'Alfama ❤️`
+      );
+      await pool.query('UPDATE abandoned_carts SET sent_3days = TRUE WHERE id = $1', [row.id]);
+      console.log(`✅ Carrinho 3 dias → ${row.phone}`);
+      await sleep(randomDelay());
+    }
+
+  } catch (err) {
+    console.error('❌ Erro carrinhos abandonados:', err.message);
+  }
+}
+
+// Jobs com intervalos variados
+let jobIndex = 0;
+const jobIntervals = [5, 10, 5, 5, 10];
+
+function scheduleNextJob() {
+  const minutes = jobIntervals[jobIndex % jobIntervals.length];
+  jobIndex++;
+  setTimeout(async () => {
+    await processFollowups();
+    await processAbandonedCarts();
+    scheduleNextJob();
+  }, minutes * 60 * 1000);
+}
 
 // ===== Shopify Token Management =====
 const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN || 'vu1ntd-yz.myshopify.com';
@@ -299,7 +456,6 @@ app.post('/create-multibanco', async (req, res) => {
 
     const morada = [address?.address1, address?.city, address?.zip].filter(Boolean).join(', ');
 
-    // Guarda na base de dados para follow-ups
     if (address?.phone) {
       await pool.query(`
         INSERT INTO followups (phone, customer_name, entity, reference, amount, morada, product_url)
@@ -313,9 +469,13 @@ app.post('/create-multibanco', async (req, res) => {
         morada,
         product_url || 'https://www.anadalfama.pt',
       ]);
+
+      await pool.query(
+        'UPDATE abandoned_carts SET converted = TRUE WHERE phone = $1',
+        [address.phone]
+      );
     }
 
-    // Telegram → Tu e amigo
     await sendTelegramMessage(
       `🆕 <b>Nova referência Multibanco gerada</b>\n\n` +
       `📦 Encomenda: <b>${draftOrder.name}</b>\n` +
@@ -353,7 +513,6 @@ async function createShopifyDraftOrder({ customer_email, customer_name, address,
   const nameParts = (customer_name || '').split(' ');
   const firstName = nameParts[0] || '';
   const lastName = nameParts.slice(1).join(' ') || '';
-
   const lineItems = cart_items?.map(item => ({ variant_id: item.variant_id, quantity: item.quantity })) || [];
 
   const body = {
@@ -407,9 +566,9 @@ app.post('/webhook', async (req, res) => {
     const customerPhone = pi.metadata?.customer_phone;
     const amount = parseFloat(pi.metadata?.amount) || (pi.amount_received / 100);
 
-    // Marca como pago na base de dados
     if (customerPhone) {
       await pool.query('UPDATE followups SET paid = TRUE WHERE phone = $1 AND paid = FALSE', [customerPhone]);
+      await pool.query('UPDATE abandoned_carts SET converted = TRUE WHERE phone = $1', [customerPhone]);
     }
 
     if (draftOrderId) {
@@ -421,7 +580,6 @@ app.post('/webhook', async (req, res) => {
           orderId: draftOrderId, orderName: order.name,
         });
 
-        // WhatsApp → Cliente (pagamento confirmado)
         if (customerPhone) {
           await sendWhatsAppMessage(customerPhone,
             `✅ *Pagamento confirmado!*\n\n` +
@@ -432,9 +590,8 @@ app.post('/webhook', async (req, res) => {
           );
         }
 
-        // Telegram → Tu e amigo
         await sendTelegramMessage(
-          `💰❤️ <b>CATCHIN! oldies hit different, bro</b> 💰❤️\n\n` +
+          `💰 <b>MOONEY! Pagamento realizado.</b>\n\n` +
           `📦 Encomenda: <b>${order.name}</b>\n` +
           `👤 Cliente: ${customerName || '—'}\n` +
           `📧 Email: ${customerEmail}\n` +
@@ -443,7 +600,7 @@ app.post('/webhook', async (req, res) => {
         );
       } else {
         await sendTelegramMessage(
-          `💰❤️ <b>CATCHIN! oldies hit different, bro</b> 💰❤️\n\n` +
+          `💰 <b>MOONEY! Pagamento realizado.</b>\n\n` +
           `📦 Encomenda: ${draftOrderName || draftOrderId}\n` +
           `👤 Cliente: ${customerName || '—'}\n` +
           `📧 Email: ${customerEmail}\n` +
@@ -482,5 +639,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Porta ${PORT}`);
   await initDB();
-  processFollowups();
+  await processFollowups();
+  await processAbandonedCarts();
+  scheduleNextJob();
 });
