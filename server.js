@@ -11,7 +11,7 @@ app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(cors());
 
-// ===== BLACKLIST — nunca enviar para estes números =====
+// ===== BLACKLIST =====
 const BLACKLIST = ['351967870703', '351933496052'];
 
 // ===== PostgreSQL =====
@@ -133,6 +133,110 @@ function formatEUR(amount) {
   return `${parseFloat(amount).toFixed(2)} €`;
 }
 
+// ===== Shopify OAuth Token (usado pelo Multibanco E pelo Theme Editor) =====
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN || 'vu1ntd-yz.myshopify.com';
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+
+let shopifyTokenCache = { token: null, expires_at: 0 };
+let refreshPromise = null;
+
+async function fetchNewShopifyToken() {
+  console.log('🔄 A obter novo token Shopify...');
+  const response = await fetch(`https://${SHOPIFY_SHOP}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'client_credentials',
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+    }),
+  });
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Falha ao obter token Shopify: ${error}`);
+  }
+  const data = await response.json();
+  shopifyTokenCache = {
+    token: data.access_token,
+    expires_at: Date.now() + (data.expires_in * 1000),
+  };
+  console.log(`✅ Novo token Shopify obtido`);
+  return shopifyTokenCache.token;
+}
+
+async function getShopifyToken() {
+  const SAFETY_MARGIN = 5 * 60 * 1000;
+  if (shopifyTokenCache.token && shopifyTokenCache.expires_at - Date.now() > SAFETY_MARGIN) {
+    return shopifyTokenCache.token;
+  }
+  if (refreshPromise) return refreshPromise;
+  refreshPromise = fetchNewShopifyToken().finally(() => { refreshPromise = null; });
+  return refreshPromise;
+}
+
+// shopifyFetch — para Multibanco (draft orders, checkouts, etc.)
+async function shopifyFetch(path, options = {}) {
+  let token = await getShopifyToken();
+  let response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
+    ...options,
+    headers: { ...options.headers, 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
+  });
+  if (response.status === 401) {
+    shopifyTokenCache.expires_at = 0;
+    token = await getShopifyToken();
+    response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
+      ...options,
+      headers: { ...options.headers, 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
+    });
+  }
+  return response;
+}
+
+// shopifyAdminFetch — para Theme Editor (usa o mesmo token OAuth)
+async function shopifyAdminFetch(path, opts = {}) {
+  const token = await getShopifyToken();
+  const res = await fetch(`https://${SHOPIFY_SHOP}/admin/api/2025-01${path}`, {
+    ...opts,
+    headers: {
+      'X-Shopify-Access-Token': token,
+      'Content-Type': 'application/json',
+      ...opts.headers,
+    },
+  });
+  if (!res.ok) throw new Error(`Shopify Admin ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+function hashData(value) {
+  if (!value) return undefined;
+  return crypto.createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
+}
+
+async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orderId, orderName }) {
+  try {
+    const eventData = {
+      data: [{
+        event_name: 'Purchase',
+        event_time: Math.floor(Date.now() / 1000),
+        action_source: 'website',
+        event_source_url: 'https://www.anadalfama.pt',
+        user_data: { em: [hashData(email)], country: [hashData('pt')] },
+        custom_data: { currency: currency.toLowerCase(), value: amount, order_id: orderName || orderId },
+      }],
+    };
+    const response = await fetch(
+      `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(eventData) }
+    );
+    const result = await response.json();
+    if (result.error) console.error('❌ Facebook CAPI erro:', result.error.message);
+    else console.log(`✅ Facebook Purchase enviado — order ${orderName}`);
+  } catch (err) {
+    console.error('❌ Erro Facebook:', err.message);
+  }
+}
+
 // ===== JOB MULTIBANCO =====
 async function processFollowups() {
   try {
@@ -198,7 +302,6 @@ async function processFollowups() {
       console.log(`✅ MB 3 dias → ${row.phone}`);
       await sleep(randomDelay());
     }
-
   } catch (err) {
     console.error('❌ Erro followups MB:', err.message);
   }
@@ -210,7 +313,6 @@ async function getAbandonedCheckouts() {
     const threeWeeksAgo = new Date();
     threeWeeksAgo.setDate(threeWeeksAgo.getDate() - 21);
     const dateFilter = threeWeeksAgo.toISOString();
-
     const response = await shopifyFetch(
       `/admin/api/2024-01/checkouts.json?status=open&limit=250&created_at_min=${dateFilter}`
     );
@@ -244,8 +346,7 @@ async function processAbandonedCarts() {
       const checkoutId = checkout.id.toString();
 
       const mbCheck = await pool.query(
-        'SELECT id FROM followups WHERE phone = $1 AND paid = FALSE',
-        [phone]
+        'SELECT id FROM followups WHERE phone = $1 AND paid = FALSE', [phone]
       );
       if (mbCheck.rows.length > 0) continue;
 
@@ -319,7 +420,6 @@ async function processAbandonedCarts() {
       console.log(`✅ Carrinho 3 dias → ${row.phone}`);
       await sleep(randomDelay());
     }
-
   } catch (err) {
     console.error('❌ Erro carrinhos abandonados:', err.message);
   }
@@ -338,107 +438,7 @@ function scheduleNextJob() {
   }, minutes * 60 * 1000);
 }
 
-// ===== Shopify Token Management (OAuth — para carrinhos abandonados) =====
-const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN || 'vu1ntd-yz.myshopify.com';
-const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
-const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
-
-let shopifyTokenCache = { token: null, expires_at: 0 };
-let refreshPromise = null;
-
-async function fetchNewShopifyToken() {
-  console.log('🔄 A obter novo token Shopify...');
-  const response = await fetch(`https://${SHOPIFY_SHOP}/admin/oauth/access_token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'client_credentials',
-      client_id: SHOPIFY_CLIENT_ID,
-      client_secret: SHOPIFY_CLIENT_SECRET,
-    }),
-  });
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Falha ao obter token Shopify: ${error}`);
-  }
-  const data = await response.json();
-  shopifyTokenCache = {
-    token: data.access_token,
-    expires_at: Date.now() + (data.expires_in * 1000),
-  };
-  console.log(`✅ Novo token Shopify obtido`);
-  return shopifyTokenCache.token;
-}
-
-async function getShopifyToken() {
-  const SAFETY_MARGIN = 5 * 60 * 1000;
-  if (shopifyTokenCache.token && shopifyTokenCache.expires_at - Date.now() > SAFETY_MARGIN) {
-    return shopifyTokenCache.token;
-  }
-  if (refreshPromise) return refreshPromise;
-  refreshPromise = fetchNewShopifyToken().finally(() => { refreshPromise = null; });
-  return refreshPromise;
-}
-
-async function shopifyFetch(path, options = {}) {
-  let token = await getShopifyToken();
-  let response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
-    ...options,
-    headers: { ...options.headers, 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
-  });
-  if (response.status === 401) {
-    shopifyTokenCache.expires_at = 0;
-    token = await getShopifyToken();
-    response = await fetch(`https://${SHOPIFY_SHOP}${path}`, {
-      ...options,
-      headers: { ...options.headers, 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
-    });
-  }
-  return response;
-}
-
-function hashData(value) {
-  if (!value) return undefined;
-  return crypto.createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
-}
-
-async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orderId, orderName }) {
-  try {
-    const eventData = {
-      data: [{
-        event_name: 'Purchase',
-        event_time: Math.floor(Date.now() / 1000),
-        action_source: 'website',
-        event_source_url: 'https://www.anadalfama.pt',
-        user_data: { em: [hashData(email)], country: [hashData('pt')] },
-        custom_data: { currency: currency.toLowerCase(), value: amount, order_id: orderName || orderId },
-      }],
-    };
-    const response = await fetch(
-      `https://graph.facebook.com/v19.0/${FB_PIXEL_ID}/events?access_token=${FB_ACCESS_TOKEN}`,
-      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(eventData) }
-    );
-    const result = await response.json();
-    if (result.error) console.error('❌ Facebook CAPI erro:', result.error.message);
-    else console.log(`✅ Facebook Purchase enviado — order ${orderName}`);
-  } catch (err) {
-    console.error('❌ Erro Facebook:', err.message);
-  }
-}
-
-// ===== SHOPIFY THEME EDITOR — Admin API (usa SHOPIFY_ADMIN_TOKEN) =====
-async function shopifyAdminFetch(path, opts = {}) {
-  const res = await fetch(`https://${SHOPIFY_SHOP}/admin/api/2025-01${path}`, {
-    ...opts,
-    headers: {
-      'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
-      'Content-Type': 'application/json',
-      ...opts.headers,
-    },
-  });
-  if (!res.ok) throw new Error(`Shopify Admin ${res.status}: ${await res.text()}`);
-  return res.json();
-}
+// ===== SHOPIFY THEME EDITOR =====
 
 // GET /api/shopify/theme — lista ficheiros do tema ativo
 app.get('/api/shopify/theme', async (req, res) => {
@@ -489,7 +489,7 @@ app.put('/api/shopify/asset', async (req, res) => {
   }
 });
 
-// POST /api/claude — proxy Claude API (chave fica no servidor)
+// POST /api/claude — proxy Claude API
 app.post('/api/claude', async (req, res) => {
   const { messages, fileName, file } = req.body;
   if (!messages) return res.status(400).json({ error: 'messages obrigatório' });
@@ -514,8 +514,8 @@ app.post('/api/claude', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-// ===== FIM SHOPIFY THEME EDITOR =====
 
+// ===== MULTIBANCO =====
 app.post('/create-multibanco', async (req, res) => {
   try {
     const { amount, currency = 'eur', customer_email, customer_name, address, cart_items, product_url } = req.body;
@@ -560,20 +560,9 @@ app.post('/create-multibanco', async (req, res) => {
       await pool.query(`
         INSERT INTO followups (phone, customer_name, entity, reference, amount, morada, product_url)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `, [
-        address.phone,
-        customer_name || '',
-        mb.entity,
-        mb.reference,
-        formatEUR(amount),
-        morada,
-        product_url || 'https://www.anadalfama.pt',
-      ]);
+      `, [address.phone, customer_name || '', mb.entity, mb.reference, formatEUR(amount), morada, product_url || 'https://www.anadalfama.pt']);
 
-      await pool.query(
-        'UPDATE abandoned_carts SET converted = TRUE WHERE phone = $1',
-        [address.phone]
-      );
+      await pool.query('UPDATE abandoned_carts SET converted = TRUE WHERE phone = $1', [address.phone]);
     }
 
     await sendTelegramMessage(
