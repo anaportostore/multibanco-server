@@ -8,7 +8,7 @@ const { Pool } = require('pg');
 
 const app = express();
 app.use('/webhook', express.raw({ type: 'application/json' }));
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 app.use(cors());
 
 // ===== BLACKLIST — nunca enviar para estes números =====
@@ -91,7 +91,6 @@ async function sendWhatsAppMessage(phone, message) {
   if (number.startsWith('00')) number = number.slice(2);
   if (number.startsWith('9') || number.startsWith('2')) number = '351' + number;
 
-  // Verifica blacklist
   if (BLACKLIST.includes(number)) {
     console.log(`⛔ Número na blacklist — não enviado: ${number}`);
     return;
@@ -257,7 +256,6 @@ async function processAbandonedCarts() {
       `, [checkoutId, phone, fullName, email, morada, checkoutUrl, new Date(checkout.created_at)]);
     }
 
-    // 20 minutos
     const res20 = await pool.query(`
       SELECT * FROM abandoned_carts
       WHERE converted = FALSE AND sent_20min = FALSE
@@ -279,7 +277,6 @@ async function processAbandonedCarts() {
       await sleep(randomDelay());
     }
 
-    // 24 horas
     const res24 = await pool.query(`
       SELECT * FROM abandoned_carts
       WHERE converted = FALSE AND sent_24h = FALSE
@@ -302,7 +299,6 @@ async function processAbandonedCarts() {
       await sleep(randomDelay());
     }
 
-    // 3 dias
     const res3d = await pool.query(`
       SELECT * FROM abandoned_carts
       WHERE converted = FALSE AND sent_3days = FALSE
@@ -329,7 +325,6 @@ async function processAbandonedCarts() {
   }
 }
 
-// Jobs com intervalos variados
 let jobIndex = 0;
 const jobIntervals = [5, 10, 5, 5, 10];
 
@@ -343,7 +338,7 @@ function scheduleNextJob() {
   }, minutes * 60 * 1000);
 }
 
-// ===== Shopify Token Management =====
+// ===== Shopify Token Management (OAuth — para carrinhos abandonados) =====
 const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN || 'vu1ntd-yz.myshopify.com';
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
@@ -430,6 +425,96 @@ async function sendFacebookPurchaseEvent({ email, amount, currency = 'eur', orde
     console.error('❌ Erro Facebook:', err.message);
   }
 }
+
+// ===== SHOPIFY THEME EDITOR — Admin API (usa SHOPIFY_ADMIN_TOKEN) =====
+async function shopifyAdminFetch(path, opts = {}) {
+  const res = await fetch(`https://${SHOPIFY_SHOP}/admin/api/2025-01${path}`, {
+    ...opts,
+    headers: {
+      'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+      'Content-Type': 'application/json',
+      ...opts.headers,
+    },
+  });
+  if (!res.ok) throw new Error(`Shopify Admin ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+// GET /api/shopify/theme — lista ficheiros do tema ativo
+app.get('/api/shopify/theme', async (req, res) => {
+  try {
+    const { themes } = await shopifyAdminFetch('/themes.json');
+    const active = themes.find(t => t.role === 'main');
+    if (!active) return res.status(404).json({ error: 'Tema ativo não encontrado' });
+    const { assets } = await shopifyAdminFetch(`/themes/${active.id}/assets.json`);
+    const tree = {};
+    assets.forEach(({ key }) => {
+      const folder = key.includes('/') ? key.split('/')[0] : 'root';
+      const file = key.split('/').slice(1).join('/') || key;
+      if (!tree[folder]) tree[folder] = [];
+      tree[folder].push(file);
+    });
+    res.json({ theme: { id: active.id, name: active.name }, tree, assets: assets.map(a => a.key) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/shopify/asset?key=sections/header.liquid&themeId=123
+app.get('/api/shopify/asset', async (req, res) => {
+  const { key, themeId } = req.query;
+  if (!key || !themeId) return res.status(400).json({ error: 'Faltam parâmetros' });
+  try {
+    const { asset } = await shopifyAdminFetch(
+      `/themes/${themeId}/assets.json?asset[key]=${encodeURIComponent(key)}`
+    );
+    res.json({ key: asset.key, value: asset.value || '' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/shopify/asset — guarda ficheiro no tema
+app.put('/api/shopify/asset', async (req, res) => {
+  const { themeId, key, value } = req.body;
+  if (!themeId || !key || value === undefined) return res.status(400).json({ error: 'Faltam parâmetros' });
+  try {
+    const result = await shopifyAdminFetch(`/themes/${themeId}/assets.json`, {
+      method: 'PUT',
+      body: JSON.stringify({ asset: { key, value } }),
+    });
+    res.json({ success: true, asset: result.asset });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/claude — proxy Claude API (chave fica no servidor)
+app.post('/api/claude', async (req, res) => {
+  const { messages, fileName, file } = req.body;
+  if (!messages) return res.status(400).json({ error: 'messages obrigatório' });
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2048,
+        system: `És um especialista em Shopify Liquid e UX no admin da "Ana Dal Fama" (anadalfama.pt), moda feminina portuguesa.${fileName ? `\nFicheiro aberto: ${fileName}` : ''}${file ? `\nConteúdo atual:\n\`\`\`liquid\n${file}\n\`\`\`` : ''}\nResponde em português de Portugal. Quando deres código usa \`\`\`liquid ... \`\`\` para que o utilizador possa aplicar com um clique.`,
+        messages,
+      }),
+    });
+    const data = await response.json();
+    res.json({ content: data.content?.[0]?.text || '' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+// ===== FIM SHOPIFY THEME EDITOR =====
 
 app.post('/create-multibanco', async (req, res) => {
   try {
